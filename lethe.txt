@@ -1,0 +1,3506 @@
+--[[
+    LETHE v1.6 + HYPER-AGGRESSIVE BUILDER v2.6 — HvH anti-aim + utility для Neverlose (CS:GO Legacy)
+    Section: Builder / Defensive / Anti-Bruteforce / Additions / Exploits / Visuals / Utility
+    (cheat.* и globalvars.* из ТЗ в текущем API NL не существуют: используются globals.* и utils.*)
+]]
+
+-- ========== КЭШ API ==========
+local ui, render, entity, events, globals, utils, rage = ui, render, entity, events, globals, utils, rage
+
+-- ========== ХЕЛПЕРЫ ==========
+
+local function find(...)
+    local ok, ref = pcall(ui.find, ...)
+    if ok and ref then return ref end
+    return nil
+end
+
+local function find_any(paths)
+    for _, p in ipairs(paths) do
+        local r = find(unpack(p))
+        if r then return r end
+    end
+    return nil
+end
+
+-- override с пропуском несуществующих пунктов; без аргументов = сброс
+local function ovr(ref, ...)
+    if ref then pcall(ref.override, ref, ...) end
+end
+
+local function safe(fn, default)
+    local ok, v = pcall(fn)
+    if ok and v ~= nil then return v end
+    return default
+end
+
+local function lerp(a, b, t) return a + (b - a) * t end
+local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+local function norm_yaw(y) return (y + 180) % 360 - 180 end
+
+local function has(list, value)
+    if type(list) ~= "table" then return false end
+    for _, v in ipairs(list) do
+        if v == value then return true end
+    end
+    return false
+end
+
+local function index_of(list, value)
+    for i, v in ipairs(list) do
+        if v == value then return i end
+    end
+    return 1
+end
+
+local function rint(lo, hi)
+    lo, hi = math.floor(lo), math.floor(hi)
+    if lo > hi then lo, hi = hi, lo end
+    return math.random(lo, hi)
+end
+
+local function shuffle(list)
+    for i = #list, 2, -1 do
+        local j = math.random(i)
+        list[i], list[j] = list[j], list[i]
+    end
+    return list
+end
+
+-- цвет -> escape-код (\aRRGGBBAA)
+local function esc(c, a)
+    return string.format("\a%02X%02X%02X%02X", math.floor(c.r), math.floor(c.g), math.floor(c.b), math.floor(a or c.a))
+end
+
+local function gradient_text(text, c1, c2, speed)
+    local out, t = "", globals.curtime
+    for i = 1, #text do
+        local wave = clamp(math.cos(8 * speed * t + (i - 1) * 10 / 30), 0, 1)
+        out = out .. string.format("\a%02X%02X%02X%02X%s",
+            math.floor(lerp(c1.r, c2.r, wave)), math.floor(lerp(c1.g, c2.g, wave)),
+            math.floor(lerp(c1.b, c2.b, wave)), math.floor(c1.a), text:sub(i, i))
+    end
+    return out
+end
+
+local function text_width(text, font)
+    local plain = (tostring(text):gsub("\a%x%x%x%x%x%x%x%x", ""))
+    return render.measure_text(font or 1, "", plain).x
+end
+
+local function draw_text(x, y, text, align, col, font)
+    col = col or color(255, 255, 255, 255)
+    if align == "c" then x = x - text_width(text, font) / 2
+    elseif align == "r" then x = x - text_width(text, font) end
+    render.text(font or 1, vector(x, y), col, "", text)
+end
+
+local function on(name, fn)
+    local ok, ev = pcall(function() return events[name] end)
+    if ok and ev then ev:set(fn) end
+end
+
+local function threat()
+    local ok, t = pcall(entity.get_threat, true)
+    if ok then return t end
+    return nil
+end
+
+local function is_warmup()
+    local gr = entity.get_game_rules()
+    if not gr then return false end
+    local v = gr.m_bWarmupPeriod
+    return v == true or v == 1
+end
+
+local function choked(cmd)
+    return safe(function() return globals.choked_commands end, safe(function() return cmd.choked_commands end, 0))
+end
+
+-- Паттерны значений для defensive
+local function pattern(kind, v1, v2, speed, tick)
+    speed = math.max(1, speed or 1)
+    if kind == "None" then return 0
+    elseif kind == "Up" then return -89
+    elseif kind == "Down" then return 89
+    elseif kind == "Zero" then return 0
+    elseif kind == "Static" or kind == "Custom" then return v1
+    elseif kind == "Swap" then return (tick % 2 == 0) and v1 or v2
+    elseif kind == "Switch" then return (math.floor(tick / speed) % 2 == 0) and v1 or v2
+    elseif kind == "Random" then return v1 + math.random() * (v2 - v1)
+    elseif kind == "3-way" then
+        local i = tick % 3
+        return i == 0 and v1 or (i == 1 and (v1 + v2) / 2 or v2)
+    elseif kind == "Sway" then return lerp(v1, v2, (math.sin(globals.curtime * speed) + 1) / 2)
+    elseif kind == "Spinbot" then return norm_yaw(globals.curtime * speed * 90)
+    end
+    return v1
+end
+
+-- ========== ССЫЛКИ НА ВСТРОЕННЫЕ ФУНКЦИИ NEVERLOSE ==========
+local R = {
+    pitch           = find("Aimbot", "Anti Aim", "Angles", "Pitch"),
+    pitch_hidden    = find_any({
+        {"Aimbot", "Anti Aim", "Angles", "Pitch", "Hidden"},
+        {"Aimbot", "Anti Aim", "Angles", "Hidden", "Pitch"},
+    }),
+    roll            = find_any({
+        {"Aimbot", "Anti Aim", "Angles", "Roll"},
+        {"Aimbot", "Anti Aim", "Angles", "Yaw", "Roll"},
+    }),
+    yaw             = find("Aimbot", "Anti Aim", "Angles", "Yaw"),
+    yaw_base        = find("Aimbot", "Anti Aim", "Angles", "Yaw", "Base"),
+    yaw_offset      = find("Aimbot", "Anti Aim", "Angles", "Yaw", "Offset"),
+    yaw_hidden      = find("Aimbot", "Anti Aim", "Angles", "Yaw", "Hidden"),
+    modifier        = find("Aimbot", "Anti Aim", "Angles", "Yaw Modifier"),
+    modifier_offset = find("Aimbot", "Anti Aim", "Angles", "Yaw Modifier", "Offset"),
+    body_yaw        = find("Aimbot", "Anti Aim", "Angles", "Body Yaw"),
+    inverter        = find("Aimbot", "Anti Aim", "Angles", "Body Yaw", "Inverter"),
+    left_limit      = find("Aimbot", "Anti Aim", "Angles", "Body Yaw", "Left Limit"),
+    right_limit     = find("Aimbot", "Anti Aim", "Angles", "Body Yaw", "Right Limit"),
+    body_options    = find("Aimbot", "Anti Aim", "Angles", "Body Yaw", "Options"),
+    body_fs         = find("Aimbot", "Anti Aim", "Angles", "Body Yaw", "Freestanding"),
+    freestanding    = find("Aimbot", "Anti Aim", "Angles", "Freestanding"),
+    edge            = find_any({
+        {"Aimbot", "Anti Aim", "Angles", "Edge Yaw"},
+        {"Aimbot", "Anti Aim", "Angles", "Yaw", "Edge Yaw"},
+        {"Aimbot", "Anti Aim", "Misc", "Edge Yaw"},
+    }),
+    fakeduck        = find("Aimbot", "Anti Aim", "Misc", "Fake Duck"),
+    slowwalk        = find("Aimbot", "Anti Aim", "Misc", "Slow Walk"),
+    legs            = find("Aimbot", "Anti Aim", "Misc", "Leg Movement"),
+    fl_enable       = find("Aimbot", "Anti Aim", "Fake Lag", "Enabled"),
+    fl_limit        = find("Aimbot", "Anti Aim", "Fake Lag", "Limit"),
+    fl_var          = find("Aimbot", "Anti Aim", "Fake Lag", "Variability"),
+    dt              = find("Aimbot", "Ragebot", "Main", "Double Tap"),
+    hs              = find("Aimbot", "Ragebot", "Main", "Hide Shots"),
+    dt_lag          = find("Aimbot", "Ragebot", "Main", "Double Tap", "Lag Options"),
+    hs_lag          = find("Aimbot", "Ragebot", "Main", "Hide Shots", "Options"),
+    native_res      = find_any({
+        {"Aimbot", "Ragebot", "Main", "Resolver"},
+        {"Aimbot", "Ragebot", "Safety", "Resolver"},
+        {"Aimbot", "Ragebot", "Main", "Enabled", "Resolver"},
+        {"Aimbot", "Ragebot", "Selection", "Resolver"},
+    }),
+}
+
+-- Hit Chance: ищем пункт в обоих вариантах пути (у разных версий NL порядок разный)
+local HC_NAMES = {"AWP", "SCAR-20 / G3SG1", "SSG 08", "Pistols", "Desert Eagle", "R8 Revolver", "Other",
+                  "Auto", "Scout", "Rifles", "SMGs", "Shotguns", "Heavy Pistols", "Revolver", "Deagle", "Heavy"}
+local hc_refs = {}
+do
+    local function add(r) if r then hc_refs[#hc_refs + 1] = r end end
+    add(find("Aimbot", "Ragebot", "Selection", "Hit Chance"))
+    for _, n in ipairs(HC_NAMES) do
+        add(find("Aimbot", "Ragebot", "Selection", n, "Hit Chance"))
+        add(find("Aimbot", "Ragebot", "Selection", "Hit Chance", n))
+    end
+end
+
+-- ========== HYPER-AGGRESSIVE: ОБЩЕЕ СОСТОЯНИЕ (одна таблица, чтобы не упереться в лимит local) ==========
+local H = {
+    hub = "Hyper-Aggressive Builder",
+    -- единый мастер-таймер AA
+    md = {last = 0, fire = true, yaw = nil, jpos = false, jit = 0, jside = false, lim_cfg = nil, lim_l = nil, lim_r = nil},
+    -- невидимый bruteforce: idx 0 = база, 1..5 = фаза
+    bf = {idx = 0, miss = 0, imp = false, hurt = false, t = 0},
+    -- anti-massive fake
+    am = {untl = 0, last = 0, wait = 3, side = false, hurts = {}},
+    logs = {}, hb = {}, hb_last = 0, hb_on = false, ref = {}, ping = 0, ping_t = 0,
+    CYAN = color(0, 238, 255, 255), NRED = color(255, 60, 70, 255),
+    GREEN = color(140, 255, 120, 255), ORANGE = color(255, 160, 90, 255), MISSC = color(255, 90, 110, 255),
+    ti = safe(function() return globals.tickinterval end, 1 / 64),
+    fs = safe(function() return render.load_font("Verdana", 11, "") end, 1),
+    fb = safe(function() return render.load_font("Verdana", 11, "b") end, 1),
+}
+
+-- Strict Hitboxes: пункты Hitboxes (разные пути у разных версий)
+do
+    local function try(...)
+        local r = find(...)
+        if r then H.hb[#H.hb + 1] = r end
+    end
+    try("Aimbot", "Ragebot", "Selection", "Hitboxes")
+    try("Rage", "Main", "Targeting", "Hitboxes")
+    for _, n in ipairs(HC_NAMES) do
+        try("Aimbot", "Ragebot", "Selection", n, "Hitboxes")
+        try("Aimbot", "Ragebot", "Selection", "Hitboxes", n)
+    end
+end
+
+-- пункты для левых индикаторов (если нет в версии NL — просто будут тусклыми)
+H.ref.ping = find_any({
+    {"Aimbot", "Ragebot", "Main", "Ping Spike"},
+    {"Aimbot", "Ragebot", "Main", "Fake Latency"},
+    {"Miscellaneous", "Main", "Other", "Fake Latency"},
+})
+H.ref.da = find_any({
+    {"Aimbot", "Ragebot", "Main", "Dormant Aimbot"},
+    {"Aimbot", "Ragebot", "Selection", "Dormant Aimbot"},
+})
+
+-- ========== ХЕЛПЕРЫ МЕНЮ ==========
+local uid = 0
+local function uniq(name)
+    uid = uid + 1
+    local n, s = uid, ""
+    while n > 0 do
+        s = s .. ((n % 2 == 1) and "\r" or "\a00000000")
+        n = math.floor(n / 2)
+    end
+    return name .. s
+end
+
+local function gear_of(el, fallback)
+    local ok, g = pcall(function() return el:create() end)
+    if ok and g then return g end
+    return fallback
+end
+
+local function sl(g, name, lo, hi, def, suf) return g:slider(uniq(name), lo, hi, def, 1, suf or "") end
+local function cb(g, name, list) return g:combo(uniq(name), list) end
+local function tog(g, name, def) return g:switch(uniq(name), def or false) end
+local function ms(g, name, list) return g:selectable(uniq(name), list) end
+
+local function sel_set(el, list)
+    pcall(el.set, el, list)
+    local got = safe(function() return el:get() end, {})
+    if type(got) ~= "table" or #got == 0 then pcall(el.set, el, unpack(list)) end
+end
+
+local function vis(el, state)
+    if not el then return end
+    if el.visibility then el:visibility(state and true or false)
+    elseif el.set_visible then el:set_visible(state and true or false) end
+end
+
+local function is_el(v)
+    local t = type(v)
+    if t == "number" or t == "string" or t == "boolean" or t == "function" then return false end
+    return safe(function() return v.get ~= nil and v.set ~= nil end, false)
+end
+
+local function mk(name, side)
+    local ok, g = pcall(ui.create, H.hub, name, side)
+    if ok and g then return g end
+    return ui.create(H.hub, name)
+end
+
+local notify -- объявлена ниже (уведомления)
+
+-- ========== МЕНЮ ==========
+pcall(ui.sidebar, H.hub, "skull")
+
+local g_ts    = mk("Team & State", 1)
+local g_build = mk("Builder", 1)
+local g_def   = mk("Defensive", 1)
+local g_bf    = mk("Anti-Bruteforce", 1)
+local g_add   = mk("Additions", 1)
+local g_exp   = mk("Exploits", 1)
+local g_vis   = mk("Visuals", 1)
+local g_utl   = mk("Utility", 1)
+local g_nav   = mk("Section", 2)
+local g_cfg   = mk("State", 2)
+local g_ow    = mk("Overwrite anti-aims", 2)
+local g_thm   = mk("Theme", 2)
+
+local username = safe(function() return common.get_username() end, "user")
+
+local M, E = {}, {}
+local PAGES = {"Builder", "Defensive", "Anti-Bruteforce", "Additions", "Exploits", "Visuals", "Utility"}
+
+M.enable  = g_nav:switch("Enable Lethe", true)
+M.section = g_nav:combo("Section", PAGES)
+local home_label = g_nav:label("Lethe · build death · v1.6.0 · " .. username)
+
+local TEAMS = {"Both", "T", "CT"}
+local conds = {"Global", "Standing", "Walking", "Running", "In Air", "In Air + C", "Crouching", "Crouching + Moving"}
+local STATE_LIST = {"Standing", "Walking", "Running", "In Air", "In Air + C", "Crouching", "Crouching + Moving"}
+local AIR_LIST = {"In Air", "In Air + C"}
+
+M.team  = g_ts:combo("Team", TEAMS)
+M.state = g_ts:combo("State", conds)
+
+-- ----- Anti-Bruteforce -----
+local function const(v) return {get = function() return v end} end
+-- вырезанные пункты Hyper-Aggressive: заглушки, чтобы остальной код не ломался
+M.h_killsay, M.h_assist, M.h_strict = const(false), const(false), const(false)
+M.h_delay, M.h_mod, M.h_range = const(0), const("Disabled"), const(30)
+M.h_ind, M.h_log, M.h_wm = const(false), const(false), const(false)
+
+M.h_bfon   = g_bf:switch("Enable Anti-Bruteforce", true)
+M.h_antimf = g_bf:switch("Anti-Massive Fake Exploit Logic", true)
+M.h_bf = {}
+for i = 1, 5 do
+    M.h_bf[i] = g_bf:slider("Bruteforce Phase " .. i .. " Angle", -180, 180, ({-45, 52, -28, 60, -60})[i], 1, "°")
+end
+
+-- ----- Body yaw (общий для Builder и Defensive) -----
+local function add_body(grp, s)
+    s.body = grp:switch(uniq("Body yaw (desync)"), true)
+    local g = gear_of(s.body, grp)
+    s.body_state     = cb(g, "State", {"Always on", "Random", "Delay"})
+    s.body_delay     = sl(g, "Delay min", 1, 14, 1, "t")
+    s.body_delay_max = sl(g, "Delay max", 1, 14, 1, "t")
+    s.body_limits    = cb(g, "Limits", {"Static", "Random", "Sway"})
+    s.lim_l   = sl(g, "Left limit", 0, 60, 0, "°")
+    s.lim_r   = sl(g, "Right limit", 0, 60, 0, "°")
+    s.lim_min = sl(g, "Limit min", 0, 60, 0, "°")
+    s.lim_max = sl(g, "Limit max", 0, 60, 0, "°")
+    s.lim_noise = sl(g, "Limit noise (±)", 0, 20, 0, "°")
+    s.body_opts = ms(g, "Options", {"Jitter", "Randomize Jitter", "Anti Bruteforce"})
+    s.body_sync = cb(g, "Side sync", {"Manual", "Follow head", "Opposite head", "Random", "Toward threat", "Away from threat"})
+    s.body_inv  = tog(g, "Inverter", false)
+    s.body_fs   = cb(g, "Freestanding", {"Off", "Peek Fake", "Peek Real"})
+end
+
+local function body_vis(s, on_)
+    vis(s.body, on_)
+    local b = on_ and s.body:get()
+    local lim = s.body_limits:get()
+    vis(s.body_state, b)
+    vis(s.body_delay, b and s.body_state:get() == "Delay")
+    vis(s.body_delay_max, b and s.body_state:get() == "Delay")
+    vis(s.body_limits, b)
+    vis(s.lim_l, b and lim == "Static"); vis(s.lim_r, b and lim == "Static")
+    vis(s.lim_min, b and lim ~= "Static"); vis(s.lim_max, b and lim ~= "Static")
+    vis(s.lim_noise, b)
+    vis(s.body_opts, b); vis(s.body_sync, b); vis(s.body_inv, b); vis(s.body_fs, b)
+end
+
+-- ----- Поля одного набора углов: Builder (= Phase 1) -----
+local AA_KEYS = {"yaw", "side_mode", "yaw_noise", "rs", "delay", "delay_mode", "delay_mirror",
+                 "mod", "mod_rand", "body", "body_state", "body_limits"}
+
+local function add_aa_fields(grp, s)
+    -- Head yaw: управляет только головой (Yaw Offset). Body yaw от него не зависит
+    s.yaw = grp:combo(uniq("Head yaw"), {"Static", "L/R"})
+    local gy = gear_of(s.yaw, grp)
+    s.yaw_static = sl(gy, "Offset", -180, 180, 0, "°")
+    s.yaw_left   = sl(gy, "Left", -180, 180, 0, "°")
+    s.yaw_right  = sl(gy, "Right", -180, 180, 0, "°")
+    s.side_mode   = cb(gy, "Side switching", {"Alternate", "Random", "Bag"})
+    s.side_bias   = sl(gy, "Left chance (Random)", 0, 100, 50, "%")
+    s.side_streak = sl(gy, "Max same side in a row", 1, 8, 3, "")
+    s.yaw_noise   = sl(gy, "Angle noise (±)", 0, 40, 0, "°")
+    s.yaw_gap     = sl(gy, "Min gap from last angle", 0, 40, 0, "°")
+
+    -- Randomize sides: случайная добавка 0..N поверх угла стороны
+    s.rs = grp:switch(uniq("Randomize sides"), false)
+    local gr = gear_of(s.rs, grp)
+    s.rs_left  = sl(gr, "Left (add 0..N)", 0, 60, 0, "°")
+    s.rs_right = sl(gr, "Right (add 0..N)", 0, 60, 0, "°")
+
+    -- Delay: своя задержка на каждую сторону
+    s.delay = grp:switch(uniq("Delay"), false)
+    local gd = gear_of(s.delay, grp)
+    s.delay_mode   = cb(gd, "Mode", {"Static", "Random", "Shuffle"})
+    s.delay_left   = sl(gd, "Left delay", 1, 14, 1, "t")
+    s.delay_right  = sl(gd, "Right delay", 1, 14, 1, "t")
+    s.delay_lmin   = sl(gd, "Left min", 1, 14, 1, "t")
+    s.delay_lmax   = sl(gd, "Left max", 1, 14, 1, "t")
+    s.delay_rmin   = sl(gd, "Right min", 1, 14, 1, "t")
+    s.delay_rmax   = sl(gd, "Right max", 1, 14, 1, "t")
+    s.delay_mirror = cb(gd, "Mirror", {"Off", "Left = Right", "Right = Left"})
+    s.delay_avoid  = tog(gd, "Avoid repeating value", true)
+
+    s.mod = grp:combo(uniq("Yaw modifier"), {"None", "Jitter", "X-ways", "Sway", "Random", "Spin"})
+    local gm = gear_of(s.mod, grp)
+    s.mod_amount  = sl(gm, "Amount", -180, 180, 0, "°")
+    s.mod_rand    = tog(gm, "Randomize amount", false)
+    s.mod_amount2 = sl(gm, "Amount (max)", -180, 180, 0, "°")
+    s.mod_ways    = sl(gm, "Ways", 3, 9, 3, "")
+    s.mod_speed   = sl(gm, "Speed", 1, 14, 3, "")
+
+    add_body(grp, s)
+end
+
+local function aa_vis(s, en)
+    vis(s.yaw, en)
+    local lr = s.yaw:get() == "L/R"
+    local sm = s.side_mode:get()
+    vis(s.yaw_static, en and not lr); vis(s.yaw_left, en and lr); vis(s.yaw_right, en and lr)
+    vis(s.side_mode, en and lr)
+    vis(s.side_bias, en and lr and sm == "Random")
+    vis(s.side_streak, en and lr and sm ~= "Alternate")
+    vis(s.yaw_noise, en); vis(s.yaw_gap, en and s.yaw_noise:get() > 0)
+    vis(s.rs, en); vis(s.rs_left, en and s.rs:get()); vis(s.rs_right, en and s.rs:get())
+
+    local d = en and s.delay:get()
+    local dm = s.delay_mode:get()
+    local rng = dm ~= "Static"
+    local mir = s.delay_mirror:get()
+    vis(s.delay, en); vis(s.delay_mode, d)
+    vis(s.delay_left, d and not rng); vis(s.delay_right, d and not rng)
+    vis(s.delay_mirror, d and rng)
+    vis(s.delay_lmin, d and rng and mir ~= "Right = Left"); vis(s.delay_lmax, d and rng and mir ~= "Right = Left")
+    vis(s.delay_rmin, d and rng and mir ~= "Left = Right"); vis(s.delay_rmax, d and rng and mir ~= "Left = Right")
+    vis(s.delay_avoid, d and dm == "Random")
+
+    vis(s.mod, en)
+    local mo = s.mod:get()
+    local m = en and mo ~= "None"
+    vis(s.mod_amount, m); vis(s.mod_rand, m); vis(s.mod_amount2, m and s.mod_rand:get())
+    vis(s.mod_ways, en and mo == "X-ways"); vis(s.mod_speed, en and (mo == "Sway" or mo == "Spin"))
+    body_vis(s, en)
+end
+
+-- ----- Набор Builder (Phase 1 = базовые углы + Freeze) -----
+local function make_builder(title)
+    local s = {shown = false}
+    s.enable = g_build:switch(uniq("Enable " .. title), false)
+    add_aa_fields(g_build, s)
+
+    -- Freeze: с шансом AA замирает на N тиков (только в базовой фазе, в фазы не входит)
+    s.freeze = g_build:switch(uniq("Freeze"), false)
+    local gf = gear_of(s.freeze, g_build)
+    s.freeze_chance = sl(gf, "Chance", 0, 100, 0, "%")
+    s.freeze_min    = sl(gf, "Freeze min", 1, 14, 1, "t")
+    s.freeze_max    = sl(gf, "Freeze max", 1, 14, 1, "t")
+    s.freeze_cd     = sl(gf, "Cooldown", 0, 40, 0, "t")
+    s.freeze_side   = cb(gf, "Freeze on", {"Current", "Left", "Right", "Random"})
+
+    function s.refresh()
+        local en = s.shown and s.enable:get()
+        vis(s.enable, s.shown)
+        aa_vis(s, en)
+        local f = en and s.freeze:get()
+        vis(s.freeze, en)
+        vis(s.freeze_chance, f); vis(s.freeze_min, f); vis(s.freeze_max, f); vis(s.freeze_cd, f); vis(s.freeze_side, f)
+    end
+    s.enable:set_callback(s.refresh)
+    s.freeze:set_callback(s.refresh)
+    for _, k in ipairs(AA_KEYS) do s[k]:set_callback(s.refresh) end
+    return s
+end
+
+-- ----- Набор Defensive -----
+local PITCH_KINDS = {"Custom", "Swap", "Switch", "Random", "3-way", "Sway", "Up", "Down", "Zero"}
+local YAW_KINDS   = {"Static", "Swap", "Switch", "Random", "Sway", "Spinbot"}
+local MOD_KINDS   = {"None", "Static", "Swap", "Switch", "Random", "Sway"}
+
+local function make_defensive(title)
+    local s = {shown = false}
+    s.enable = g_def:switch(uniq("Enable " .. title), false)
+
+    s.pitch = g_def:combo(uniq("Pitch"), PITCH_KINDS)
+    local gp = gear_of(s.pitch, g_def)
+    s.p1   = sl(gp, "Value 1", -89, 89, 0, "°")
+    s.p2   = sl(gp, "Value 2", -89, 89, 0, "°")
+    s.pspd = sl(gp, "Speed", 1, 14, 1, "")
+
+    s.yaw = g_def:combo(uniq("Yaw"), YAW_KINDS)
+    local gy = gear_of(s.yaw, g_def)
+    s.y1   = sl(gy, "Value 1", -180, 180, 0, "°")
+    s.y2   = sl(gy, "Value 2", -180, 180, 0, "°")
+    s.yspd = sl(gy, "Speed", 1, 14, 1, "")
+
+    s.mod = g_def:combo(uniq("Modifier"), MOD_KINDS)
+    local gm = gear_of(s.mod, g_def)
+    s.m1   = sl(gm, "Value 1", -180, 180, 0, "°")
+    s.m2   = sl(gm, "Value 2", -180, 180, 0, "°")
+    s.mspd = sl(gm, "Speed", 1, 14, 1, "")
+
+    -- Delay: как часто меняются значения Swap / Switch / 3-way внутри defensive-окна
+    s.dl_mode = g_def:combo(uniq("Delay mode"), {"Static", "Random", "Shuffle"})
+    s.dl_min  = sl(g_def, "Delay", 1, 14, 1, "t")
+    s.dl_max  = sl(g_def, "Delay max", 1, 14, 1, "t")
+
+    add_body(g_def, s)
+
+    function s.refresh()
+        local en = s.shown and s.enable:get()
+        vis(s.enable, s.shown)
+        vis(s.pitch, en); vis(s.yaw, en); vis(s.mod, en)
+        vis(s.dl_mode, en); vis(s.dl_min, en); vis(s.dl_max, en and s.dl_mode:get() ~= "Static")
+        body_vis(s, en)
+    end
+    for _, k in ipairs({"enable", "dl_mode", "body", "body_state", "body_limits"}) do
+        s[k]:set_callback(s.refresh)
+    end
+    return s
+end
+
+local Bs, Ds = {}, {}
+for _, team in ipairs(TEAMS) do
+    Bs[team], Ds[team] = {}, {}
+    for i, c in ipairs(conds) do
+        Bs[team][i] = make_builder(c)
+        Ds[team][i] = make_defensive(c)
+    end
+end
+Bs.Both[1].enable:set(true) -- Global включён по умолчанию, чтобы AA работал сразу
+
+-- ----- Старый Bruteforce удалён: заглушки, чтобы остальной код не ломался -----
+local BF = {ph = {}}
+M.bf_on, M.bf_dist, M.bf_trigger = const(false), const(60), const({})
+M.bf_count, M.bf_flip, M.bf_states = const(2), const(false), const({})
+M.bf_tmin, M.bf_tmax = const(3), const(5)
+local function bf_refresh() end
+
+-- ----- Copy / Paste State -----
+local clip = {builder = nil, defensive = nil}
+
+local function current_set(kind)
+    local sets = kind == "builder" and Bs or Ds
+    return sets[M.team:get()][index_of(conds, M.state:get())]
+end
+
+local function snapshot(s)
+    local vals = {}
+    for k, v in pairs(s) do
+        if is_el(v) then vals[k] = v:get() end
+    end
+    return vals
+end
+
+local function restore(s, vals)
+    for k, v in pairs(vals) do
+        if is_el(s[k]) then pcall(s[k].set, s[k], v) end
+    end
+    s.refresh()
+end
+
+local function page_kind()
+    local p = M.section:get()
+    if p == "Builder" then return "builder" end
+    if p == "Defensive" then return "defensive" end
+end
+
+M.copy  = g_cfg:button("Copy State", function()
+    local k = page_kind()
+    if k then clip[k] = snapshot(current_set(k)) end
+end)
+M.paste = g_cfg:button("Paste State", function()
+    local k = page_kind()
+    if k and clip[k] then restore(current_set(k), clip[k]) end
+end)
+local load_preset
+M.preset = g_cfg:button("Load aggressive preset", function() if load_preset then load_preset() end end)
+
+do -- локальные gear-группы не засоряют основной scope (лимит 200 local)
+-- ----- Additions -----
+M.yaw_base  = g_add:combo("Yaw base", {"At Target", "Local View"})
+
+M.rfl = g_add:switch("Random Fakelag", false)
+local g_rfl = gear_of(M.rfl, g_add)
+M.rfl_min = sl(g_rfl, "Min ticks", 1, 14, 1, "t")
+M.rfl_max = sl(g_rfl, "Max ticks", 1, 14, 1, "t")
+
+M.backstab = g_add:switch("Anti-backstab", true)
+local g_bs = gear_of(M.backstab, g_add)
+M.bs_dist = sl(g_bs, "Distance", 100, 800, 350, "u")
+
+M.safehead = g_add:switch("Safehead", true)
+local g_sh = gear_of(M.safehead, g_add)
+M.safe_cond = ms(g_sh, "Conditions", {"Knife", "Zeus", "Dormant"})
+sel_set(M.safe_cond, {"Knife", "Zeus"})
+
+M.manual = g_add:switch("Manual yaw", false)
+local g_mn = gear_of(M.manual, g_add)
+M.key_left  = g_mn:hotkey(uniq("Left"))
+M.key_right = g_mn:hotkey(uniq("Right"))
+M.key_fwd   = g_mn:hotkey(uniq("Forward"))
+M.man_type  = cb(g_mn, "Mode", {"Default", "Static", "Jitter"})
+
+M.fstand = g_add:switch("Freestanding", false)
+local g_fs = gear_of(M.fstand, g_add)
+M.fs_cond = ms(g_fs, "Conditions", {"Standing", "Moving"})
+sel_set(M.fs_cond, {"Standing", "Moving"})
+M.fs_type = cb(g_fs, "Mode", {"Default", "Static", "Jitter"})
+M.fs_wall = sl(g_fs, "Wall distance", 20, 100, 45, "u")
+
+M.legit_use = g_add:switch("Legit AA on use", false)
+
+M.res = g_add:switch("Resolver", false)
+local g_rs = gear_of(M.res, g_add)
+M.res_mode  = cb(g_rs, "Mode", {"Smart", "Aggressive", "Brute"})
+M.res_max   = sl(g_rs, "Max desync", 20, 60, 58, "°")
+M.res_jit   = tog(g_rs, "Jitter detection", true)
+M.res_flick = tog(g_rs, "LBY flick detection", true)
+M.res_amp   = tog(g_rs, "Adaptive amplitude", true)
+M.res_mem   = tog(g_rs, "Remember hits", true)
+M.res_native = tog(g_rs, "Disable built-in resolver", true)
+M.res_log   = tog(g_rs, "Show in logs", true)
+M.res_reset = tog(g_rs, "Reset on round start", true)
+
+M.ow_warmup = g_ow:combo("WarmUp", {"Off", "Legit", "Spin", "Jitter"})
+M.ow_end    = g_ow:combo("On Round End", {"Off", "Legit", "Spin", "Jitter"})
+
+-- ----- Exploits -----
+E.ex = g_exp:switch("Extended Yaw", false)
+local g1 = gear_of(E.ex, g_exp)
+E.ex_states  = ms(g1, "States", STATE_LIST)
+E.ex_pattern = cb(g1, "Sweep pattern", {"Sine", "Saw", "Zigzag", "Random"})
+E.ex_range   = sl(g1, "Sweep range", 20, 180, 90, "°")
+E.ex_speed   = sl(g1, "Sweep speed", 1, 10, 4, "")
+E.ex_noise   = sl(g1, "Micro noise", 0, 30, 6, "°")
+E.ex_vary    = tog(g1, "Vary body limits", true)
+
+-- Airlag: лаг ТОЛЬКО в состоянии In Air (не In Air + C, не на земле)
+E.al = g_exp:switch("Airlag", false)
+local g2 = gear_of(E.al, g_exp)
+E.al_mode    = cb(g2, "Mode", {"Ideal tick", "Max choke", "Random"})
+E.al_trigger = cb(g2, "Trigger", {"Always in air", "After jump start", "At peak"})
+E.al_limit   = sl(g2, "Max ticks", 2, 14, 14, "t")
+E.al_extra   = sl(g2, "Extra ticks (Ideal)", 0, 4, 0, "t")
+E.al_def     = tog(g2, "Force defensive", false)
+
+E.ff = g_exp:switch("Defensive flick", false)
+local g3 = gear_of(E.ff, g_exp)
+E.ff_states   = ms(g3, "States", STATE_LIST)
+E.ff_mode     = cb(g3, "Mode", {"Interval", "Defensive"})
+E.ff_interval = sl(g3, "Interval", 4, 64, 20, "t")
+E.ff_hold     = sl(g3, "Hold", 1, 8, 2, "t")
+E.ff_angle    = sl(g3, "Angle", 30, 180, 90, "°")
+E.ff_dir      = cb(g3, "Direction", {"Left", "Right", "Alternate", "Random"})
+E.ff_pitch    = cb(g3, "Pitch", {"Keep", "Up", "Down", "Zero"})
+
+E.sk = g_exp:switch("Anti-Skeet", false)
+local g4 = gear_of(E.sk, g_exp)
+E.sk_states = ms(g4, "States", STATE_LIST)
+E.sk_min    = sl(g4, "Min hold", 1, 12, 2, "t")
+E.sk_max    = sl(g4, "Max hold", 1, 12, 6, "t")
+E.sk_jit    = sl(g4, "Yaw noise", 0, 40, 12, "°")
+E.sk_vary   = tog(g4, "Vary limits", true)
+
+E.mf = g_exp:switch("Massive Fake", false)
+local g5 = gear_of(E.mf, g_exp)
+E.mf_states = ms(g5, "States", STATE_LIST)
+E.mf_style  = cb(g5, "Style", {"Defensive flick", "Always max", "Jitter max"})
+E.mf_angle  = sl(g5, "Flick offset", 90, 180, 180, "°")
+E.mf_limit  = sl(g5, "Fake limit", 30, 60, 60, "°")
+E.mf_flip   = sl(g5, "Side flip ticks", 1, 10, 3, "t")
+E.mf_pitch  = cb(g5, "Flick pitch", {"Off", "Up", "Down", "Random"})
+
+E.sc = g_exp:switch("Scoliosis", false)
+local g6 = gear_of(E.sc, g_exp)
+E.sc_states = ms(g6, "States", STATE_LIST)
+E.sc_mode   = cb(g6, "Type", {"Twist", "Wave", "Chaos"})
+E.sc_amount = sl(g6, "Amount", 10, 89, 70, "°")
+E.sc_speed  = sl(g6, "Speed", 1, 14, 6, "")
+E.sc_roll   = tog(g6, "Use roll (if available)", false)
+
+E.as = g_exp:switch("Air Stop", false)
+local g7 = gear_of(E.as, g_exp)
+E.as_states = ms(g7, "States", AIR_LIST)
+E.as_mode   = cb(g7, "Mode", {"Counter-strafe", "Zero input"})
+E.as_speed  = sl(g7, "Stop above speed", 0, 60, 10, "u/s")
+E.as_target = tog(g7, "Only with target", true)
+E.as_ready  = tog(g7, "Only when weapon ready", true)
+
+E.ha = g_exp:switch("Air Hitchance", false)
+local g8 = gear_of(E.ha, g_exp)
+E.ha_states = ms(g8, "States", AIR_LIST)
+E.ha_val    = sl(g8, "Hitchance", 0, 100, 50, "%")
+
+E.fl = g_add:switch("Fake Flick", false)
+local g9 = gear_of(E.fl, g_add)
+E.fl_states = ms(g9, "States", STATE_LIST)
+E.fl_every  = sl(g9, "Force defensive every", 2, 14, 7, "t")
+
+for _, el in ipairs({E.ex_states, E.ff_states, E.mf_states, E.sk_states, E.sc_states}) do
+    sel_set(el, STATE_LIST)
+end
+sel_set(E.as_states, AIR_LIST)
+sel_set(E.fl_states, STATE_LIST)
+sel_set(E.ha_states, AIR_LIST)
+
+-- ----- Theme -----
+M.c_logo = g_thm:color_picker(uniq("Logo color"), color(150, 125, 255, 255))
+M.c_text = g_thm:color_picker(uniq("Text color"), color(235, 235, 245, 255))
+M.c_bg   = g_thm:color_picker(uniq("Background color"), color(14, 14, 20, 210))
+M.glow   = g_thm:switch(uniq("Glow"), true)
+local g_glow = gear_of(M.glow, g_thm)
+M.c_glow   = g_glow:color_picker(uniq("Glow color"), color(150, 125, 255, 255))
+M.glow_amt = sl(g_glow, "Glow strength", 0, 100, 45, "%")
+
+-- ----- Visuals -----
+M.ind = g_vis:switch("Crosshair indicators", false)
+local gind = gear_of(M.ind, g_vis)
+M.ind_style = cb(gind, "Style", {"Branded", "Ideal yaw"})
+M.arrows = g_vis:switch("Manual arrows", false)
+-- Watermark: как на скрине (плашка с иконками), элементы можно убирать
+M.wm = g_vis:switch("Custom watermark", false)
+local gwm = gear_of(M.wm, g_vis)
+M.wm_type  = cb(gwm, "Position", {"Top right", "Top left", "Left", "Right", "Bottom"})
+M.wm_items = ms(gwm, "Elements", {"Script name", "Username", "FPS", "Ping", "Time"})
+sel_set(M.wm_items, {"Script name", "Username", "FPS", "Ping", "Time"})
+-- Левые индикаторы как на скрине (PING / DA / YAW / HIT %)
+M.sideind = g_vis:switch("Side indicators", false)
+local gsi = gear_of(M.sideind, g_vis)
+M.si_items = ms(gsi, "Items", {"Ping", "Dormant aim", "Yaw", "Hit rate"})
+sel_set(M.si_items, {"Ping", "Dormant aim", "Yaw", "Hit rate"})
+-- Логи: Table = строки по центру внизу как на скрине
+M.logs = g_vis:switch("Aimbot logging", true)
+local glog = gear_of(M.logs, g_vis)
+M.log_style = cb(glog, "Style", {"Table", "Modern", "Minimal", "Card"})
+M.log_out   = ms(glog, "Output", {"In Console", "On Screen", "Statistic"})
+M.log_time  = sl(glog, "Notification time", 2, 10, 4, "s")
+sel_set(M.log_out, {"In Console", "On Screen"})
+M.aspect = g_vis:switch("Aspect ratio", false)
+local gasp = gear_of(M.aspect, g_vis)
+M.aspect_val = sl(gasp, "Value (178 = 16:9)", 100, 250, 178, "")
+-- Custom chat / HUD / scoreboard (по скриншотам)
+M.vchat = g_vis:switch("Custom chat", false)
+local gvc = gear_of(M.vchat, g_vis)
+M.vchat_time  = sl(gvc, "Message time", 5, 30, 12, "s")
+M.vchat_input = tog(gvc, "Input bar (Y / U)", true)
+M.vhud   = g_vis:switch("Custom HUD (money / health / armor)", false)
+M.vboard = g_vis:switch("Custom scoreboard (TAB)", false)
+
+-- ----- Utility -----
+M.quick   = g_utl:switch("Quick switch", false)
+M.ladder  = g_utl:switch("Fast ladder", false)
+M.edge    = g_utl:switch("Edge yaw on fakeduck", false)
+M.killsay = g_utl:combo("Killsay", {"None", "Phrases", "RU", "EN", "1"})
+M.anim    = g_utl:switch("Anim. breakers", false)
+local gan = gear_of(M.anim, g_utl)
+M.anim_ground = cb(gan, "On ground", {"Static", "Jitter", "Kangaroo"})
+M.anim_value  = sl(gan, "Ground value", 0, 10, 5, "")
+M.anim_air    = cb(gan, "In air", {"Off", "Static", "Kangaroo"})
+end
+
+-- ========== ВИДИМОСТЬ СТРАНИЦ ==========
+local function update_ui()
+    local page = M.section:get()
+    local team, st = M.team:get(), M.state:get()
+
+    local bd = page == "Builder" or page == "Defensive"
+    vis(M.team, bd); vis(M.state, bd); vis(M.copy, bd); vis(M.paste, bd)
+    vis(M.preset, page == "Builder")
+
+    for _, t in ipairs(TEAMS) do
+        for i, c in ipairs(conds) do
+            Bs[t][i].shown = (page == "Builder" and t == team and c == st)
+            Ds[t][i].shown = (page == "Defensive" and t == team and c == st)
+            Bs[t][i].refresh(); Ds[t][i].refresh()
+        end
+    end
+
+    local a = page == "Additions"
+    vis(M.yaw_base, a); vis(M.rfl, a); vis(M.rfl_min, a and M.rfl:get()); vis(M.rfl_max, a and M.rfl:get())
+    vis(M.backstab, a); vis(M.bs_dist, a and M.backstab:get())
+    vis(M.safehead, a); vis(M.safe_cond, a and M.safehead:get())
+    vis(M.manual, a); vis(M.fstand, a)
+    vis(M.key_left, a and M.manual:get()); vis(M.key_right, a and M.manual:get())
+    vis(M.key_fwd, a and M.manual:get());  vis(M.man_type, a and M.manual:get())
+    vis(M.fs_cond, a and M.fstand:get()); vis(M.fs_type, a and M.fstand:get()); vis(M.fs_wall, a and M.fstand:get())
+    vis(M.ow_warmup, a); vis(M.ow_end, a)
+    vis(M.legit_use, a)
+    vis(E.fl, a); vis(E.fl_states, a and E.fl:get()); vis(E.fl_every, a and E.fl:get())
+    vis(M.res, a)
+    local rs_on = a and M.res:get()
+    vis(M.res_mode, rs_on); vis(M.res_max, rs_on); vis(M.res_jit, rs_on); vis(M.res_flick, rs_on); vis(M.res_amp, rs_on); vis(M.res_mem, rs_on); vis(M.res_native, rs_on); vis(M.res_log, rs_on); vis(M.res_reset, rs_on)
+
+    local x = page == "Exploits"
+    for _, k in ipairs({"ex", "al", "ff", "sk", "mf", "sc", "as", "ha"}) do vis(E[k], x) end
+    local ex_on = x and E.ex:get()
+    vis(E.ex_states, ex_on); vis(E.ex_pattern, ex_on); vis(E.ex_range, ex_on)
+    vis(E.ex_speed, ex_on); vis(E.ex_noise, ex_on); vis(E.ex_vary, ex_on)
+    local al_on = x and E.al:get()
+    vis(E.al_mode, al_on); vis(E.al_trigger, al_on); vis(E.al_limit, al_on)
+    vis(E.al_extra, al_on and E.al_mode:get() == "Ideal tick"); vis(E.al_def, al_on)
+    local f = x and E.ff:get()
+    vis(E.ff_states, f); vis(E.ff_mode, f); vis(E.ff_interval, f and E.ff_mode:get() == "Interval")
+    vis(E.ff_hold, f); vis(E.ff_angle, f); vis(E.ff_dir, f); vis(E.ff_pitch, f)
+    local sk_on = x and E.sk:get()
+    vis(E.sk_states, sk_on); vis(E.sk_min, sk_on); vis(E.sk_max, sk_on); vis(E.sk_jit, sk_on); vis(E.sk_vary, sk_on)
+    local mf_on = x and E.mf:get()
+    local mfd = mf_on and E.mf_style:get() == "Defensive flick"
+    vis(E.mf_states, mf_on); vis(E.mf_style, mf_on); vis(E.mf_angle, mfd); vis(E.mf_pitch, mfd)
+    vis(E.mf_limit, mf_on); vis(E.mf_flip, mf_on and E.mf_style:get() ~= "Jitter max")
+    local sc_on = x and E.sc:get()
+    vis(E.sc_states, sc_on); vis(E.sc_mode, sc_on); vis(E.sc_amount, sc_on); vis(E.sc_speed, sc_on); vis(E.sc_roll, sc_on)
+    local as_on = x and E.as:get()
+    vis(E.as_states, as_on); vis(E.as_mode, as_on); vis(E.as_speed, as_on); vis(E.as_target, as_on); vis(E.as_ready, as_on)
+    local ha_on = x and E.ha:get()
+    vis(E.ha_states, ha_on); vis(E.ha_val, ha_on)
+
+    local v = page == "Visuals"
+    vis(M.ind, v); vis(M.ind_style, v and M.ind:get())
+    vis(M.arrows, v)
+    vis(M.wm, v); vis(M.wm_type, v and M.wm:get()); vis(M.wm_items, v and M.wm:get())
+    vis(M.sideind, v); vis(M.si_items, v and M.sideind:get())
+    vis(M.logs, v); vis(M.log_style, v and M.logs:get()); vis(M.log_out, v and M.logs:get()); vis(M.log_time, v and M.logs:get())
+    vis(M.aspect, v); vis(M.aspect_val, v and M.aspect:get())
+    vis(M.vchat, v); vis(M.vchat_time, v and M.vchat:get()); vis(M.vchat_input, v and M.vchat:get()); vis(M.vhud, v); vis(M.vboard, v)
+
+    vis(M.c_logo, v); vis(M.c_text, v); vis(M.c_bg, v)
+    vis(M.glow, v); vis(M.c_glow, v and M.glow:get()); vis(M.glow_amt, v and M.glow:get())
+
+    local u = page == "Utility"
+    vis(M.quick, u); vis(M.ladder, u); vis(M.edge, u); vis(M.killsay, u); vis(M.anim, u)
+    vis(M.anim_ground, u and M.anim:get()); vis(M.anim_value, u and M.anim:get()); vis(M.anim_air, u and M.anim:get())
+
+    local h = page == "Anti-Bruteforce"
+    vis(M.h_bfon, h); vis(M.h_antimf, h)
+    for i = 1, 5 do vis(M.h_bf[i], h) end
+
+    bf_refresh()
+    vis(home_label, true)
+end
+
+local watch = {M.section, M.team, M.state, M.rfl, M.backstab, M.safehead, M.manual, M.fstand,
+               E.ex, E.al, E.al_mode, E.ff, E.ff_mode, E.sk, E.mf, E.mf_style, E.sc, E.as, E.ha, E.fl, M.res,
+               M.ind, M.wm, M.sideind, M.logs, M.aspect, M.anim, M.glow, M.vchat}
+for _, el in ipairs(watch) do el:set_callback(update_ui) end
+update_ui()
+
+-- ========== СТАРТОВЫЙ ПРЕСЕТ ==========
+load_preset = function()
+    local function fill(s, p)
+        for k, v in pairs(p) do
+            if s[k] then pcall(s[k].set, s[k], v) end
+        end
+        if s.refresh then s.refresh() end
+    end
+    local function setv(el, v) if el then pcall(el.set, el, v) end end
+
+    -- ===== Builder: агрессивный HvH =====
+    -- Global: широкие стороны, быстрые тики, шум, перемешанный delay, freeze
+    fill(Bs.Both[1], {enable = true, yaw = "L/R", yaw_left = -34, yaw_right = 36,
+        side_mode = "Bag", side_streak = 2, yaw_noise = 7, yaw_gap = 5,
+        rs = true, rs_left = 12, rs_right = 12,
+        delay = true, delay_mode = "Shuffle", delay_lmin = 1, delay_lmax = 4, delay_rmin = 1, delay_rmax = 4,
+        delay_mirror = "Off", freeze = true, freeze_chance = 14, freeze_min = 2, freeze_max = 3, freeze_cd = 10,
+        freeze_side = "Current",
+        mod = "X-ways", mod_ways = 5, mod_amount = 26, mod_rand = true, mod_amount2 = 38,
+        body = true, body_state = "Delay", body_delay = 1, body_delay_max = 2,
+        body_limits = "Random", lim_min = 42, lim_max = 60, lim_noise = 3, body_sync = "Opposite head"})
+
+    local function state(i, p)
+        pcall(Bs.Both[i].enable.set, Bs.Both[i].enable, true)
+        fill(Bs.Both[i], p)
+    end
+    state(2, {yaw = "L/R", yaw_left = -38, yaw_right = 40, side_mode = "Bag", side_streak = 2, yaw_noise = 6,
+        delay = true, delay_mode = "Shuffle", delay_lmin = 2, delay_lmax = 5, delay_rmin = 2, delay_rmax = 5,
+        mod = "Jitter", mod_amount = 24, body = true, body_state = "Delay", body_delay = 1, body_delay_max = 3,
+        body_limits = "Random", lim_min = 45, lim_max = 60, body_sync = "Opposite head"})
+    state(3, {yaw = "L/R", yaw_left = -22, yaw_right = 24, side_mode = "Random", side_bias = 50, side_streak = 2,
+        delay = true, delay_mode = "Random", delay_lmin = 1, delay_lmax = 3, delay_rmin = 1, delay_rmax = 3,
+        mod = "Jitter", mod_amount = 30, body = true, body_state = "Always on",
+        body_limits = "Random", lim_min = 40, lim_max = 58, body_sync = "Follow head"})
+    state(4, {yaw = "L/R", yaw_left = -26, yaw_right = 28, side_mode = "Bag", side_streak = 2,
+        delay = true, delay_mode = "Shuffle", delay_lmin = 1, delay_lmax = 3, delay_rmin = 1, delay_rmax = 3,
+        mod = "X-ways", mod_ways = 5, mod_amount = 34, body = true, body_state = "Delay",
+        body_delay = 1, body_delay_max = 2, body_limits = "Random", lim_min = 38, lim_max = 60, body_sync = "Opposite head"})
+    for _, i in ipairs({5, 6}) do
+        state(i, {yaw = "L/R", yaw_left = -10, yaw_right = 14, side_mode = "Alternate",
+            delay = true, delay_mode = "Static", delay_left = 1, delay_right = 1,
+            mod = "Jitter", mod_amount = 48, body = true, body_state = "Always on",
+            body_limits = "Static", lim_l = 60, lim_r = 60, body_sync = "Manual"})
+    end
+    for _, i in ipairs({7, 8}) do
+        state(i, {yaw = "L/R", yaw_left = -30, yaw_right = 36, side_mode = "Bag", side_streak = 2, yaw_noise = 5,
+            delay = true, delay_mode = "Shuffle", delay_lmin = 2, delay_lmax = 4, delay_rmin = 2, delay_rmax = 4,
+            mod = "Jitter", mod_amount = 28, body = true, body_state = "Delay", body_delay = 1, body_delay_max = 2,
+            body_limits = "Static", lim_l = 60, lim_r = 60, body_sync = "Opposite head"})
+    end
+
+    -- ===== Defensive: быстрые смены pitch/yaw в окне =====
+    fill(Ds.Both[1], {enable = true, pitch = "Swap", p1 = -89, p2 = 89, yaw = "Random", y1 = -180, y2 = 180,
+        mod = "Swap", m1 = -35, m2 = 35, dl_mode = "Random", dl_min = 1, dl_max = 3, body = false})
+    pcall(Ds.Both[5].enable.set, Ds.Both[5].enable, true)
+    fill(Ds.Both[5], {pitch = "Switch", p1 = -89, p2 = 0, pspd = 1, yaw = "Sway", y1 = -140, y2 = 140, yspd = 6,
+        mod = "None", dl_mode = "Static", dl_min = 1, dl_max = 1, body = false})
+
+    -- ===== Additions =====
+    setv(M.rfl, true); setv(M.rfl_min, 3); setv(M.rfl_max, 10)
+    setv(M.backstab, true); setv(M.bs_dist, 400)
+    setv(M.safehead, true)
+    setv(M.legit_use, true)
+    setv(M.res, true); setv(M.res_mode, "Aggressive"); setv(M.res_max, 58); setv(M.res_jit, true)
+    setv(M.res_flick, true); setv(M.res_amp, true); setv(M.res_mem, true); setv(M.res_native, true)
+
+    -- ===== Exploits: только то, что полезно сразу =====
+    setv(E.al, true); setv(E.al_mode, "Ideal tick"); setv(E.al_trigger, "Always in air"); setv(E.al_limit, 14)
+    setv(E.as, true); setv(E.as_mode, "Counter-strafe")
+    setv(E.ha, true); setv(E.ha_val, 45)
+
+    -- ===== Visuals / Utility =====
+    setv(M.ind, true); setv(M.arrows, true); setv(M.wm, true); setv(M.sideind, true)
+    setv(M.logs, true); setv(M.log_style, "Table")
+    setv(M.quick, true); setv(M.ladder, true); setv(M.killsay, "Phrases")
+
+    update_ui()
+end
+
+-- Первый запуск: один раз ставим агрессивный пресет (потом настройки не затираем).
+-- Если db недоступна — пресет ставится кнопкой «Load starter preset».
+pcall(function()
+    if db and not db.lethe_preset_v16 then
+        load_preset()
+        db.lethe_preset_v16 = true
+    end
+end)
+
+-- ========== СОСТОЯНИЕ СКРИПТА ==========
+local cur_raw = 2
+local cur_bs = nil
+local manual_dir, last_manual = 0, 0
+local stats = {hit = 0, miss = 0}
+local was_enabled = false
+local round_ended = false
+
+-- Движок сторон: side=true -> left
+local eng = {side = false, last = 0, wait = 1, bside = false, blast = 0, bwait = 1, ron = true, rside = false,
+             limL = nil, limR = nil, flipped = false, frozen = false, streak = 1, sidebag = {},
+             bags = {}, lastd = {}, fz_cd = 0, last_yaw = 0,
+             phase = 1, phase_until = 0, bf_imp = false, bf_hurt = false, bf_flip = false}
+local DEF_WINDOW = 13
+local def = {max = 0, ticks = 0, active = false, age = 0, windows = 0, forced = false, exploit = false}
+local ff = {cycle = -1, sign = 1}
+local mf = {side = 1, last = 0}
+local ex = {limit = 60, last = -1}
+local sk = {side = false, last = 0, wait = 2, run = 0, limit = 60}
+local air = {ticks = 0, choke = 0, target = 0}
+local rfl = {limit = 1}
+local fs = {active = false, hold = 0}
+local hc_warned = false
+
+-- ========== СОСТОЯНИЕ ИГРОКА ==========
+local function get_state(cmd, lp)
+    local speed = lp.m_vecVelocity:length2d()
+    local on_ground = bit.band(lp.m_fFlags, 1) == 1
+    local air_now = (not on_ground) or cmd.in_jump
+    local fd = R.fakeduck and R.fakeduck:get()
+    local duck = lp.m_flDuckAmount > 0.7 or fd
+    local slow = R.slowwalk and R.slowwalk:get()
+
+    local raw
+    if air_now and duck then raw = 6
+    elseif air_now then raw = 5
+    elseif duck and speed > 10 then raw = 8
+    elseif duck then raw = 7
+    elseif slow and speed > 10 then raw = 3
+    elseif speed > 5 then raw = 4
+    else raw = 2 end
+    return raw, on_ground
+end
+
+local function state_ok(sel, raw) return has(sel:get(), conds[raw]) end
+
+local function resolve(sets, team_num, raw)
+    local function try(t)
+        if not t then return nil end
+        local st = sets[t]
+        if st[raw].enable:get() then return st[raw] end
+        if st[1].enable:get() then return st[1] end
+        return nil
+    end
+    local tn = (team_num == 2 and "T") or (team_num == 3 and "CT") or nil
+    return try(tn) or try("Both")
+end
+
+-- ========== DEFENSIVE-ДВИЖОК ==========
+local function track_defensive(lp)
+    local tb = lp.m_nTickBase
+    if math.abs(tb - def.max) > 64 then def.max = 0 end
+    if tb > def.max then def.max = tb end
+    def.ticks = clamp(def.max - tb - 1, 0, 14)
+
+    def.exploit = ((R.dt and R.dt:get()) or (R.hs and R.hs:get())) and true or false
+    local was = def.active
+    def.active = def.exploit and def.ticks > 0 and def.ticks <= DEF_WINDOW
+
+    if def.active and not was then
+        def.age = 0; def.windows = def.windows + 1
+    elseif def.active then
+        def.age = def.age + 1
+    else
+        def.age = 0
+    end
+end
+
+local function set_defensive(cmd, want)
+    if want and def.exploit then
+        pcall(function() rage.exploit:allow_defensive(true) end)
+        pcall(function() cmd.force_defensive = true end)
+        ovr(R.dt_lag, "Always On")
+        def.forced = true
+    elseif def.forced then
+        pcall(function() rage.exploit:allow_defensive(false) end)
+        ovr(R.dt_lag)
+        def.forced = false
+    end
+end
+
+local function hidden_angles(pitch, yaw)
+    ovr(R.yaw_hidden, true); ovr(R.pitch_hidden, true)
+    if pitch then pcall(function() rage.antiaim:override_hidden_pitch(pitch) end) end
+    if yaw then pcall(function() rage.antiaim:override_hidden_yaw_offset(yaw) end) end
+end
+
+local function clear_hidden() ovr(R.yaw_hidden); ovr(R.pitch_hidden) end
+
+local function flick_pitch_value(opt)
+    if opt == "Up" then return -89
+    elseif opt == "Down" then return 89
+    elseif opt == "Zero" then return 0
+    elseif opt == "Random" then return math.random(0, 1) == 0 and -89 or 89 end
+    return nil
+end
+
+-- ========== РУЧНОЙ YAW ==========
+local function update_manual()
+    if not M.manual:get() then manual_dir = 0 return end
+    local now = globals.realtime
+    if now < last_manual then last_manual = now end
+    if now - last_manual < 0.2 then return end
+    local function toggle(dir) manual_dir = (manual_dir == dir) and 0 or dir; last_manual = now end
+    if M.key_right:get() then toggle(90)
+    elseif M.key_left:get() then toggle(-90)
+    elseif M.key_fwd:get() then toggle(180) end
+end
+
+-- ========== ДВИЖОК СТОРОН (Side / Delay / Freeze / Anti-bruteforce) ==========
+
+-- выбор значения из диапазона: Random (без повтора подряд) или Shuffle (мешок без повторов)
+local function pick_range(lo, hi, key, mode, avoid)
+    lo, hi = math.floor(lo), math.floor(hi)
+    if lo > hi then lo, hi = hi, lo end
+    if lo == hi then return lo end
+
+    if mode == "Shuffle" then
+        local bk = key .. ":" .. lo .. ":" .. hi
+        local b = eng.bags[key]
+        if not b or b.key ~= bk or #b.list == 0 then
+            local list = {}
+            for v = lo, hi do list[#list + 1] = v end
+            b = {key = bk, list = shuffle(list)}
+            eng.bags[key] = b
+        end
+        return table.remove(b.list)
+    end
+
+    local v = math.random(lo, hi)
+    if avoid then
+        for _ = 1, 3 do
+            if v ~= eng.lastd[key] then break end
+            v = math.random(lo, hi)
+        end
+    end
+    eng.lastd[key] = v
+    return v
+end
+
+-- сколько тиков держать сторону. left = сторона, на которую только что перешли
+local function side_wait(bs, left)
+    if not (bs and bs.delay:get()) then return 1 end
+    local mode = bs.delay_mode:get()
+    if mode == "Static" then
+        return left and bs.delay_left:get() or bs.delay_right:get()
+    end
+    local lmin, lmax = bs.delay_lmin:get(), bs.delay_lmax:get()
+    local rmin, rmax = bs.delay_rmin:get(), bs.delay_rmax:get()
+    local mir = bs.delay_mirror:get()
+    if mir == "Left = Right" then rmin, rmax = lmin, lmax
+    elseif mir == "Right = Left" then lmin, lmax = rmin, rmax end
+    local avoid = bs.delay_avoid:get()
+    if left then return pick_range(lmin, lmax, "L", mode, avoid) end
+    return pick_range(rmin, rmax, "R", mode, avoid)
+end
+
+-- выбор следующей стороны: Alternate / Random (с шансом и лимитом серии) / Bag (2L+2R перемешаны)
+local function pick_side(bs)
+    local mode = bs and bs.side_mode:get() or "Alternate"
+    if not bs or bs.yaw:get() ~= "L/R" or mode == "Alternate" then return not eng.side end
+
+    local new
+    if mode == "Random" then
+        new = math.random(100) <= bs.side_bias:get()
+    else
+        if #eng.sidebag == 0 then eng.sidebag = shuffle({true, true, false, false}) end
+        new = table.remove(eng.sidebag)
+    end
+
+    if new == eng.side then eng.streak = eng.streak + 1 else eng.streak = 1 end
+    if eng.streak > bs.side_streak:get() then
+        new = not eng.side
+        eng.streak = 1
+    end
+    return new
+end
+
+-- ----- Bruteforce: смена фаз (старая система; при удалённой вкладке остаётся выключенной) -----
+local function bf_step()
+    local tick = globals.tickcount
+    if eng.phase > 1 and (tick >= eng.phase_until or eng.phase_until - tick > 64 * 30) then eng.phase = 1 end
+
+    if not M.bf_on:get() then
+        eng.phase = 1
+        eng.bf_imp, eng.bf_hurt = false, false
+        return
+    end
+
+    local imp, hurt = eng.bf_imp, eng.bf_hurt
+    eng.bf_imp, eng.bf_hurt = false, false
+    if not (imp or hurt) then return end
+
+    local sel = M.bf_trigger:get()
+    local fire = (hurt and has(sel, "Got hit")) or (imp and not hurt and has(sel, "Enemy miss"))
+    if not fire then return end
+
+    local cnt = M.bf_count:get()
+    if eng.phase < 2 then eng.phase = 2
+    elseif eng.phase < cnt then eng.phase = eng.phase + 1
+    else eng.phase = 2 end
+
+    local ti = safe(function() return globals.tickinterval end, 1 / 64)
+    eng.phase_until = tick + math.floor(rint(M.bf_tmin:get(), M.bf_tmax:get()) / ti)
+    eng.limL = nil
+    if M.bf_flip:get() then eng.bf_flip = true end
+end
+
+-- какой набор углов сейчас работает: базовый Builder или фаза Bruteforce
+local function active_block(bs)
+    if bs and eng.phase > 1 and M.bf_on:get() and state_ok(M.bf_states, cur_raw) then
+        return BF.ph[eng.phase] or bs
+    end
+    return bs
+end
+
+local function engine_tick(cmd, bs)
+    local tick = globals.tickcount
+    if tick < eng.last then eng.last, eng.blast, eng.fz_cd = tick, tick, 0 end
+    if choked(cmd) ~= 0 then return end
+    local blk = active_block(bs)
+
+    -- Bruteforce: мгновенная смена стороны при срабатывании
+    if eng.bf_flip then
+        eng.bf_flip = false
+        if blk then
+            eng.side = not eng.side
+            eng.flipped = true
+            eng.streak = 1
+            eng.bside = not eng.bside
+            eng.last = tick
+            eng.wait = math.max(1, side_wait(blk, eng.side))
+            return
+        end
+    end
+
+    if tick - eng.last < eng.wait then return end
+    eng.last = tick
+    eng.ron = math.random() < 0.5
+    eng.rside = math.random() < 0.5
+
+    -- Freeze (только из базового Builder): с шансом AA замирает на min..max тиков
+    if bs and bs.freeze:get() and tick >= eng.fz_cd and math.random(100) <= bs.freeze_chance:get() then
+        local dur = math.max(1, rint(bs.freeze_min:get(), bs.freeze_max:get()))
+        local fo = bs.freeze_side:get()
+        local want = eng.side
+        if fo == "Left" then want = true
+        elseif fo == "Right" then want = false
+        elseif fo == "Random" then want = math.random() < 0.5 end
+        if want ~= eng.side then eng.flipped = true end
+        eng.side = want
+        eng.wait = dur
+        eng.frozen = true
+        eng.fz_cd = tick + dur + bs.freeze_cd:get()
+        return
+    end
+
+    eng.frozen = false
+    local new = pick_side(blk)
+    if new ~= eng.side then eng.flipped = true end
+    eng.side = new
+    eng.wait = math.max(1, side_wait(blk, eng.side))
+end
+
+-- ========== HEAD YAW ИЗ БИЛДЕРА (только yaw offset, body не трогает) ==========
+local function compute_yaw(bs, tick)
+    local yaw
+    local left = eng.side
+    if bs.yaw:get() == "L/R" then
+        yaw = left and bs.yaw_left:get() or bs.yaw_right:get()
+        if bs.rs:get() then
+            -- случайная добавка 0..N поверх угла стороны (влево — минус, вправо — плюс)
+            local r = left and bs.rs_left:get() or bs.rs_right:get()
+            local add = math.random() * r
+            yaw = yaw + (left and -add or add)
+        end
+    else
+        yaw = bs.yaw_static:get()
+    end
+
+    local m = bs.mod:get()
+    if m ~= "None" then
+        local a = bs.mod_amount:get()
+        if bs.mod_rand:get() then a = lerp(a, bs.mod_amount2:get(), math.random()) end
+        if m == "Jitter" then
+            yaw = yaw + ((tick % 2 == 0) and a / 2 or -a / 2)
+        elseif m == "X-ways" then
+            local n = math.max(3, bs.mod_ways:get())
+            yaw = yaw + ((tick % n) / (n - 1) * 2 - 1) * a / 2
+        elseif m == "Sway" then
+            yaw = yaw + math.sin(globals.curtime * bs.mod_speed:get()) * a / 2
+        elseif m == "Random" then
+            yaw = yaw + (math.random() * 2 - 1) * a / 2
+        elseif m == "Spin" then
+            local rng = math.max(1, math.abs(a))
+            yaw = yaw + ((globals.curtime * bs.mod_speed:get() * 45) % rng) - rng / 2
+        end
+    end
+
+    -- шум угла: не повторяем предыдущий угол ближе чем на gap
+    local noise = bs.yaw_noise:get()
+    if noise > 0 then
+        local gap, y = bs.yaw_gap:get(), yaw
+        for _ = 1, 5 do
+            y = yaw + (math.random() * 2 - 1) * noise
+            if math.abs(norm_yaw(y - eng.last_yaw)) >= gap then break end
+        end
+        yaw = y
+    end
+    eng.last_yaw = yaw
+    return norm_yaw(yaw)
+end
+
+-- ========== ВСПОМОГАТЕЛЬНОЕ ДЛЯ AA ==========
+local AAX = {}
+
+-- true, если основная угроза слева от нашего взгляда; nil, если угрозы нет
+function AAX.threat_left()
+    local lp, t = entity.get_local_player(), threat()
+    if not lp or not t then return nil end
+    local ok, r = pcall(function()
+        local d = t:get_origin() - lp:get_origin()
+        local to = math.deg(math.atan2(d.y, d.x))
+        return norm_yaw(to - render.camera_angles().y) > 0
+    end)
+    if ok then return r end
+    return nil
+end
+
+-- рядом бомба/заложник: Legit AA on use не должен мешать взаимодействию
+function AAX.near_objective(lp)
+    local o = lp:get_origin()
+    for _, cls in ipairs({"CPlantedC4", "CHostage"}) do
+        for _, e in ipairs(safe(function() return entity.get_entities(cls) end, {})) do
+            if safe(function() return o:dist(e:get_origin()) end, 9999) < 110 then return true end
+        end
+    end
+    return false
+end
+
+-- ========== BODY YAW ==========
+local function set_limits(l, r)
+    ovr(R.left_limit, l)
+    ovr(R.right_limit, r or l)
+end
+
+local function apply_body(cfg, cmd)
+    if not cfg.body:get() then ovr(R.body_yaw, false) return end
+    ovr(R.body_yaw, true)
+
+    -- лимиты: пересчитываются только когда сработал мастер-таймер (или сменился набор настроек)
+    local md = H.md
+    local lim_l, lim_r
+    if md.fire or md.lim_cfg ~= cfg or not md.lim_l then
+        -- Static / Random (бросок при смене стороны) / Sway (плавно между min и max)
+        local lm = cfg.body_limits:get()
+        lim_l, lim_r = 0, 0
+        if lm == "Static" then
+            lim_l, lim_r = cfg.lim_l:get(), cfg.lim_r:get()
+        elseif lm == "Random" then
+            if eng.flipped or not eng.limL then
+                eng.limL = rint(cfg.lim_min:get(), cfg.lim_max:get())
+                eng.limR = rint(cfg.lim_min:get(), cfg.lim_max:get())
+            end
+            lim_l, lim_r = eng.limL, eng.limR
+        else
+            local t = (math.sin(globals.curtime * 2.2) + 1) / 2
+            lim_l = lerp(cfg.lim_min:get(), cfg.lim_max:get(), t)
+            lim_r = lerp(cfg.lim_min:get(), cfg.lim_max:get(), 1 - t)
+        end
+        local noise = cfg.lim_noise:get()
+        if noise > 0 then
+            lim_l = clamp(lim_l + (math.random() * 2 - 1) * noise, 0, 60)
+            lim_r = clamp(lim_r + (math.random() * 2 - 1) * noise, 0, 60)
+        end
+        md.lim_cfg, md.lim_l, md.lim_r = cfg, lim_l, lim_r
+    else
+        lim_l, lim_r = md.lim_l, md.lim_r
+    end
+    set_limits(lim_l, lim_r)
+
+    local opts = safe(function() return cfg.body_opts:get() end, {})
+    if type(opts) ~= "table" then opts = {} end
+    local jit = has(opts, "Jitter") or has(opts, "Randomize Jitter")
+    ovr(R.body_options, opts)
+    ovr(R.body_fs, cfg.body_fs:get())
+
+    local state = cfg.body_state:get()
+    if state == "Delay" then
+        local tick = globals.tickcount
+        if tick < eng.blast then eng.blast = tick end
+        if choked(cmd) == 0 and tick - eng.blast >= eng.bwait then
+            eng.bside = not eng.bside
+            eng.blast = tick
+            local dmin = cfg.body_delay:get()
+            eng.bwait = rint(dmin, math.max(dmin, cfg.body_delay_max:get()))
+        end
+    end
+
+    if not jit then
+        local inv = cfg.body_inv:get()
+        local sync = cfg.body_sync:get()
+        if sync == "Follow head" then inv = (inv ~= eng.side)
+        elseif sync == "Opposite head" then inv = (inv ~= (not eng.side))
+        elseif sync == "Random" then inv = (inv ~= eng.rside)
+        elseif sync == "Toward threat" or sync == "Away from threat" then
+            local tl = AAX.threat_left()
+            if tl ~= nil then
+                if sync == "Away from threat" then tl = not tl end
+                inv = (inv ~= tl)
+            end
+        end
+        if state == "Delay" then inv = (inv ~= eng.bside)
+        elseif state == "Random" then inv = (inv ~= eng.rside) end
+        ovr(R.inverter, inv)
+    end
+
+    if state == "Random" and not eng.ron then ovr(R.body_yaw, false) end
+end
+
+-- ========== DEFENSIVE ИЗ ВКЛАДКИ DEFENSIVE ==========
+-- шаг паттернов defensive: счётчик растёт раз в N тиков (delay), все Swap/Switch/3-way идут по нему
+local dfs = {last = 0, wait = 1, step = 0}
+local function def_step(ds)
+    local tick = globals.tickcount
+    if tick < dfs.last then dfs.last = tick end
+    if tick - dfs.last < dfs.wait then return end
+    dfs.last = tick
+    dfs.step = dfs.step + 1
+    local m, lo, hi = ds.dl_mode:get(), ds.dl_min:get(), ds.dl_max:get()
+    dfs.wait = (m == "Static") and lo or pick_range(lo, hi, "D", m, true)
+    dfs.wait = math.max(1, dfs.wait)
+end
+
+local function apply_defensive(ds, cmd)
+    if not ds or manual_dir ~= 0 or not def.active then return false end
+    def_step(ds)
+    local tick = dfs.step
+
+    local pitch = pattern(ds.pitch:get(), ds.p1:get(), ds.p2:get(), ds.pspd:get(), tick)
+    local yaw   = pattern(ds.yaw:get(), ds.y1:get(), ds.y2:get(), ds.yspd:get(), tick)
+    local m = ds.mod:get()
+    if m ~= "None" then yaw = yaw + pattern(m, ds.m1:get(), ds.m2:get(), ds.mspd:get(), tick) end
+
+    hidden_angles(clamp(pitch, -89, 89), norm_yaw(yaw))
+    apply_body(ds, cmd)
+    return true
+end
+
+-- ========== BRUTEFORCE: СОБЫТИЯ ==========
+-- пуля пролетела рядом с головой (промах врага) — флаг; урон по нам — отдельный флаг.
+-- Эти события кормят Anti-Bruteforce (фиксированная дистанция 70u).
+on("bullet_impact", function(e)
+    local lp = entity.get_local_player()
+    if not lp or not lp:is_alive() or not M.enable:get() then return end
+
+    local shooter = entity.get(e.userid, true)
+    if not shooter or shooter == lp or not shooter:is_enemy() then return end
+
+    local ok, d = pcall(function()
+        local s, h = shooter:get_eye_position(), lp:get_eye_position()
+        local dx, dy, dz = e.x - s.x, e.y - s.y, e.z - s.z
+        local len2 = dx * dx + dy * dy + dz * dz
+        if len2 < 1 then return 9999 end
+        local t = clamp(((h.x - s.x) * dx + (h.y - s.y) * dy + (h.z - s.z) * dz) / len2, 0, 1)
+        local px, py, pz = s.x + dx * t, s.y + dy * t, s.z + dz * t
+        return math.sqrt((px - h.x) ^ 2 + (py - h.y) ^ 2 + (pz - h.z) ^ 2)
+    end)
+    if ok and d then
+        if M.bf_on:get() and d <= M.bf_dist:get() then eng.bf_imp = true end
+        if d <= 70 then H.bf.imp = true end
+    end
+end)
+
+on("player_hurt", function(e)
+    local lp = entity.get_local_player()
+    if not lp or not M.enable:get() then return end
+    if entity.get(e.userid, true) ~= lp then return end
+    local attacker = entity.get(e.attacker, true)
+    if not attacker or attacker == lp or not attacker:is_enemy() then return end
+
+    if M.bf_on:get() then eng.bf_hurt = true end
+    H.bf.hurt = true
+
+    -- Anti-massive: повторные попадания за короткое окно = наш desync читают
+    if M.h_antimf:get() then
+        local now = globals.realtime
+        local hs = H.am.hurts
+        hs[#hs + 1] = now
+        for i = #hs, 1, -1 do
+            if now - hs[i] > 3 then table.remove(hs, i) end
+        end
+        if #hs >= 2 then H.am.untl = now + 2.5 end
+    end
+end)
+
+-- ========== МОДУЛЬ: DEFENSIVE FLICK ==========
+local function module_flick(cmd, base_yaw)
+    local tick = globals.tickcount
+    local mode, hold, interval = E.ff_mode:get(), E.ff_hold:get(), E.ff_interval:get()
+    local cycle, flicking
+
+    if mode == "Defensive" then
+        cycle = def.windows
+        flicking = def.active and def.age < hold
+    else
+        cycle = math.floor(tick / interval)
+        flicking = (tick % interval) < hold
+    end
+
+    if cycle ~= ff.cycle then
+        ff.cycle = cycle
+        local d = E.ff_dir:get()
+        if d == "Left" then ff.sign = -1
+        elseif d == "Right" then ff.sign = 1
+        elseif d == "Alternate" then ff.sign = -ff.sign
+        else ff.sign = math.random(0, 1) == 0 and -1 or 1 end
+    end
+    if not flicking then return end
+
+    local angle = E.ff_angle:get() * ff.sign
+    ovr(R.modifier, "Disabled")
+    ovr(R.yaw_offset, norm_yaw(base_yaw + angle))
+    ovr(R.body_yaw, true); ovr(R.body_options, {}); set_limits(60)
+    ovr(R.inverter, ff.sign < 0)
+
+    local opt = E.ff_pitch:get()
+    local pv = flick_pitch_value(opt ~= "Keep" and opt or "Off")
+    if def.active then
+        hidden_angles(pv, angle)
+    else
+        if opt == "Up" then ovr(R.pitch, "Fake Up")
+        elseif opt == "Down" then ovr(R.pitch, "Fake Down")
+        elseif opt == "Zero" then ovr(R.pitch, "Disabled") end
+    end
+end
+
+-- ========== МОДУЛЬ: MASSIVE FAKE ==========
+local function module_massive(cmd, base_yaw)
+    local style, lim, tick = E.mf_style:get(), E.mf_limit:get(), globals.tickcount
+
+    if tick < mf.last then mf.last = tick end
+    if style ~= "Jitter max" and tick - mf.last >= E.mf_flip:get() and choked(cmd) == 0 then
+        mf.side = -mf.side
+        mf.last = tick
+    end
+
+    if style == "Jitter max" then
+        ovr(R.modifier, "Center"); ovr(R.modifier_offset, 24)
+        ovr(R.body_yaw, true); ovr(R.body_options, {"Jitter"}); set_limits(lim)
+    else
+        ovr(R.body_yaw, true); ovr(R.body_options, {}); set_limits(lim)
+        ovr(R.inverter, mf.side < 0)
+        ovr(R.modifier, "Disabled")
+        ovr(R.yaw_offset, norm_yaw(base_yaw + mf.side * 8))
+    end
+
+    if style == "Defensive flick" and def.active and def.age < 3 then
+        hidden_angles(flick_pitch_value(E.mf_pitch:get()), E.mf_angle:get() * mf.side)
+    end
+end
+
+-- ========== МОДУЛЬ: EXTENDED YAW ==========
+local function module_extended(cmd, base_yaw)
+    local t = globals.curtime * E.ex_speed:get()
+    local range, pat = E.ex_range:get(), E.ex_pattern:get()
+    local sweep
+    if pat == "Sine" then sweep = math.sin(t * 2)
+    elseif pat == "Saw" then sweep = (t % 1) * 2 - 1
+    elseif pat == "Zigzag" then sweep = math.abs((t % 2) - 1) * 2 - 1
+    else sweep = math.random() * 2 - 1 end
+
+    local noise = (math.random() * 2 - 1) * E.ex_noise:get()
+    ovr(R.modifier, "Disabled")
+    ovr(R.yaw_offset, norm_yaw(base_yaw + sweep * range + noise))
+
+    ovr(R.body_yaw, true); ovr(R.body_options, {"Jitter"})
+    if E.ex_vary:get() then
+        local step = math.floor(globals.tickcount / 3)
+        if step ~= ex.last then ex.last = step; ex.limit = math.random(34, 60) end
+        set_limits(ex.limit)
+    else
+        set_limits(60)
+    end
+end
+
+-- ========== МОДУЛЬ: ANTI-SKEET ==========
+local SK_LIMITS = {29, 38, 45, 52, 58, 60}
+local function module_antiskeet(cmd, base_yaw)
+    local tick = globals.tickcount
+    if tick < sk.last then sk.last = tick end
+
+    if choked(cmd) == 0 and tick - sk.last >= sk.wait then
+        sk.last = tick
+        local lo = E.sk_min:get()
+        sk.wait = rint(lo, math.max(lo, E.sk_max:get()))
+
+        local nxt = math.random() < 0.5
+        if nxt == sk.side then sk.run = sk.run + 1 else sk.run = 1 end
+        if sk.run > 2 then nxt = not nxt; sk.run = 1 end
+        sk.side = nxt
+        sk.limit = E.sk_vary:get() and SK_LIMITS[math.random(1, #SK_LIMITS)] or 60
+    end
+
+    ovr(R.body_yaw, true); ovr(R.body_options, {})
+    set_limits(sk.limit); ovr(R.inverter, sk.side)
+    ovr(R.modifier, "Disabled")
+    ovr(R.yaw_offset, norm_yaw(base_yaw + (sk.side and -1 or 1) * rint(0, E.sk_jit:get())))
+end
+
+-- ========== МОДУЛЬ: SCOLIOSIS ==========
+local function module_scoliosis(cmd, base_yaw)
+    local mode, amt, spd = E.sc_mode:get(), E.sc_amount:get(), E.sc_speed:get()
+    local t = globals.tickcount
+    local pitch, yaw
+
+    if mode == "Twist" then
+        local s = (t % 2 == 0) and 1 or -1
+        pitch, yaw = s * amt, s * amt * 2
+    elseif mode == "Wave" then
+        pitch = math.sin(globals.curtime * spd) * amt
+        yaw = math.cos(globals.curtime * spd) * amt * 2
+    else
+        pitch, yaw = (math.random() * 2 - 1) * amt, (math.random() * 2 - 1) * 180
+    end
+
+    if def.active then
+        hidden_angles(clamp(pitch, -89, 89), norm_yaw(yaw))
+    else
+        ovr(R.yaw_offset, norm_yaw(base_yaw + yaw * 0.25))
+    end
+    if E.sc_roll:get() and R.roll then ovr(R.roll, clamp(pitch * 0.6, -50, 50)) end
+end
+
+-- ========== FREESTANDING (авто: у стены + виден враг) ==========
+local function near_wall(lp)
+    local ok, res = pcall(function()
+        local o = lp:get_origin() + vector(0, 0, 40)
+        local yaw = render.camera_angles().y
+        local dist = M.fs_wall:get()
+        for a = 0, 315, 45 do
+            local r = math.rad(yaw + a)
+            local e = o + vector(math.cos(r) * dist, math.sin(r) * dist, 0)
+            local tr = utils.trace_line(o, e, lp)
+            if tr and tr.fraction < 0.95 then return true end
+        end
+        return false
+    end)
+    if ok then return res end
+    return nil
+end
+
+local function update_freestanding(lp, raw)
+    local want = false
+    if M.fstand:get() and manual_dir == 0 and not is_warmup() then
+        local sel = M.fs_cond:get()
+        local standing = has(sel, "Standing") and (raw == 2 or raw == 7)
+        local moving = has(sel, "Moving") and (raw == 3 or raw == 4 or raw == 8)
+        if (standing or moving) and threat() ~= nil then
+            want = near_wall(lp) ~= false
+        end
+    end
+    if want then fs.hold = globals.tickcount + 8 end
+    if globals.tickcount < fs.hold - 64 then fs.hold = 0 end
+    fs.active = globals.tickcount < fs.hold
+end
+
+-- ========== ДОП. РЕЖИМЫ ==========
+local function overwrite(mode)
+    if mode == "Legit" then
+        ovr(R.yaw_base, "Local View"); ovr(R.pitch, "Disabled")
+        ovr(R.yaw_offset, 180); ovr(R.modifier, "Disabled")
+        ovr(R.body_yaw, true); ovr(R.body_options, {}); set_limits(58); ovr(R.inverter, true)
+    elseif mode == "Spin" then
+        ovr(R.yaw_offset, norm_yaw(globals.curtime * 720)); ovr(R.modifier, "Disabled")
+        ovr(R.body_yaw, false); ovr(R.pitch, "Disabled")
+    elseif mode == "Jitter" then
+        ovr(R.modifier, "Center"); ovr(R.modifier_offset, 60)
+        ovr(R.body_yaw, true); ovr(R.body_options, {"Jitter"}); set_limits(60)
+    end
+    clear_hidden()
+end
+
+local function apply_specials(lp, raw)
+    local warmup = is_warmup()
+
+    if manual_dir ~= 0 and not warmup then
+        ovr(R.yaw_base, "Local View")
+        local mt = M.man_type:get()
+        if mt == "Static" then
+            ovr(R.modifier, "Disabled")
+            ovr(R.body_yaw, true); ovr(R.body_options, {}); ovr(R.inverter, false)
+        elseif mt == "Jitter" then
+            ovr(R.modifier, "Center"); ovr(R.modifier_offset, 35)
+            ovr(R.body_yaw, true); ovr(R.body_options, {"Jitter"})
+        end
+        clear_hidden()
+    end
+
+    if fs.active then
+        ovr(R.freestanding, true)
+        local ft = M.fs_type:get()
+        if ft == "Static" then
+            ovr(R.yaw_offset, 5); ovr(R.modifier, "Disabled"); ovr(R.body_yaw, false)
+        elseif ft == "Jitter" then
+            ovr(R.yaw_offset, 10); ovr(R.modifier, "Center"); ovr(R.modifier_offset, 35)
+            ovr(R.body_yaw, true); ovr(R.body_options, {"Jitter"})
+        end
+    end
+
+    if M.safehead:get() then
+        local weapon = lp:get_player_weapon()
+        local cls = weapon and weapon:get_classname() or ""
+        local sel = M.safe_cond:get()
+        local trigger = false
+        if raw == 6 then
+            if has(sel, "Knife") and cls == "CKnife" then trigger = true end
+            if has(sel, "Zeus") and cls == "CWeaponTaser" then trigger = true end
+        end
+        if has(sel, "Dormant") then
+            local t = threat()
+            if t and lp:get_origin():dist(t:get_origin()) > 900 then trigger = true end
+        end
+        if trigger then
+            ovr(R.modifier, "Disabled"); ovr(R.modifier_offset, 0); ovr(R.yaw_offset, 14)
+            ovr(R.body_yaw, false); ovr(R.pitch, "Down"); clear_hidden()
+        end
+    end
+
+    if M.backstab:get() then
+        local origin = lp:get_origin()
+        local maxd = M.bs_dist:get()
+        for _, enemy in ipairs(entity.get_players(true)) do
+            local w = enemy:get_player_weapon()
+            if w and w:get_classname() == "CKnife" and origin:dist(enemy:get_origin()) <= maxd then
+                ovr(R.yaw_offset, 180); ovr(R.yaw_base, "At Target"); clear_hidden()
+                break
+            end
+        end
+    end
+
+    if warmup and M.ow_warmup:get() ~= "Off" then overwrite(M.ow_warmup:get()) end
+    if round_ended and M.ow_end:get() ~= "Off" then overwrite(M.ow_end:get()) end
+end
+
+-- ========== AIR LAG ==========
+-- Лагаем только в состоянии In Air (raw == 5). In Air + C и земля не затрагиваются.
+-- Ideal tick: чанкаем ровно столько тиков, чтобы смещение между отправками превысило 64 юнита
+-- (так ломается lag compensation), чем быстрее движение — тем меньше тиков нужно.
+local function apply_air_lag(cmd, lp, raw)
+    local function reset() ovr(R.fl_limit); ovr(R.fl_var); air.choke = 0; air.target = 0 end
+
+    if not E.al:get() or raw ~= 5 then reset() return false end
+
+    local v = lp.m_vecVelocity
+    local trig = E.al_trigger:get()
+    local go = trig == "Always in air"
+        or (trig == "After jump start" and air.ticks >= 3)
+        or (trig == "At peak" and math.abs(v.z) <= 90)
+    if not go then reset() return false end
+
+    local mode, maxt = E.al_mode:get(), E.al_limit:get()
+    local ticks
+    if mode == "Ideal tick" then
+        local speed = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+        local ti = safe(function() return globals.tickinterval end, 1 / 64)
+        if speed > 1 then
+            ticks = math.ceil(64 / (speed * ti)) + E.al_extra:get()
+        else
+            ticks = maxt
+        end
+    elseif mode == "Random" then
+        if air.choke == 0 or air.target == 0 then air.target = rint(2, maxt) end
+        ticks = air.target
+    else
+        ticks = maxt
+    end
+    ticks = clamp(ticks, 2, maxt)
+
+    ovr(R.fl_enable, true); ovr(R.fl_limit, ticks); ovr(R.fl_var, 0)
+
+    if air.choke < ticks then
+        pcall(function() cmd.send_packet = false end)
+        air.choke = air.choke + 1
+    else
+        pcall(function() cmd.send_packet = true end)
+        air.choke = 0
+    end
+    return E.al_def:get()
+end
+
+-- ========== AIR STOP ==========
+local function weapon_ready(lp)
+    local w = lp:get_player_weapon()
+    if not w then return false end
+    return safe(function()
+        local now = globals.curtime
+        return w.m_flNextPrimaryAttack <= now and lp.m_flNextAttack <= now
+    end, true)
+end
+
+local function apply_air_stop(cmd, lp, raw)
+    if not E.as:get() or not state_ok(E.as_states, raw) then return end
+    if E.as_target:get() and not threat() then return end
+    if E.as_ready:get() and not weapon_ready(lp) then return end
+
+    local vel = lp.m_vecVelocity
+    local speed = vel:length2d()
+    if speed < E.as_speed:get() then return end
+
+    if E.as_mode:get() == "Zero input" then
+        cmd.forwardmove, cmd.sidemove = 0, 0
+        pcall(function()
+            cmd.in_forward, cmd.in_back, cmd.in_moveleft, cmd.in_moveright = false, false, false, false
+        end)
+        return
+    end
+
+    -- counter-strafe: тянем в сторону, противоположную скорости (в системе координат взгляда)
+    local yaw = math.rad(cmd.view_angles.y)
+    local fwd  = vel.x * math.cos(yaw) + vel.y * math.sin(yaw)
+    local side = vel.x * math.sin(yaw) - vel.y * math.cos(yaw)
+    local mag = math.sqrt(fwd * fwd + side * side)
+    if mag < 1 then return end
+    local k = clamp(mag / 25, 0, 1) * 450
+    cmd.forwardmove = clamp(-fwd / mag * k, -450, 450)
+    cmd.sidemove    = clamp(-side / mag * k, -450, 450)
+end
+
+-- ========== AIR HITCHANCE ==========
+local function apply_air_hitchance(raw)
+    local use = E.ha:get() and state_ok(E.ha_states, raw)
+    if E.ha:get() and #hc_refs == 0 and not hc_warned then
+        hc_warned = true
+        print("[lethe] Air Hitchance: пункты Hit Chance не найдены в вашей версии NL")
+        if notify then notify("miss", {title = "AIR HC", name = "hitchance refs not found"}) end
+    end
+    for _, ref in ipairs(hc_refs) do
+        if use then ovr(ref, E.ha_val:get()) else ovr(ref) end
+    end
+end
+
+-- ========== FAKE FLICK ==========
+-- Берём пресет из присланного скрипта: пока эксплойт заряжен — yaw 5, Random-модификатор, body 42/42,
+-- hidden pitch 89 и hidden yaw -90, Break LC для HS, Always On для DT, force defensive каждые N тиков
+local fl = {on = false}
+local function apply_fakeflick(cmd, raw)
+    local want = E.fl:get() and state_ok(E.fl_states, raw) and manual_dir == 0
+    if want then
+        local charge = safe(function() return rage.exploit:get() end, 1)
+        if charge < 1 then want = false end
+    end
+
+    if not want then
+        if fl.on then
+            ovr(R.hs_lag)
+            if not def.forced then ovr(R.dt_lag) end
+            fl.on = false
+        end
+        return
+    end
+
+    fl.on = true
+    pcall(function() rage.antiaim:inverter(false) end)
+    ovr(R.inverter, false)
+    ovr(R.yaw_offset, 5)
+    ovr(R.modifier, "Random"); ovr(R.modifier_offset, 5)
+    ovr(R.body_yaw, true); ovr(R.body_options, "")
+    set_limits(42)
+    ovr(R.freestanding, false)
+    hidden_angles(89, -90)
+    ovr(R.hs_lag, "Break LC")
+    ovr(R.dt_lag, "Always On")
+    pcall(function() cmd.force_defensive = (cmd.command_number % E.fl_every:get()) == 0 end)
+end
+
+-- ========== HYPER-AGGRESSIVE: AA-ЛОГИКА ==========
+
+-- встроенный резольвер NL как «базовый»; наш RES работает и в режиме Assist
+function H.res_on() return M.res:get() or M.h_assist:get() end
+
+-- Strict Hitboxes Only: сканируем только Head / Chest / Stomach (руки, ноги, стопы отключены)
+function H.apply_hitboxes()
+    local want = M.enable:get() and M.h_strict:get()
+    local tick = globals.tickcount
+    if tick < H.hb_last then H.hb_last = 0 end
+    if want ~= H.hb_on or (want and tick - H.hb_last > 64) then
+        H.hb_last, H.hb_on = tick, want
+        for i = 1, #H.hb do
+            if want then ovr(H.hb[i], {"Head", "Chest", "Stomach"}) else ovr(H.hb[i]) end
+        end
+    end
+end
+
+-- ЕДИНЫЙ мастер-таймер: все пересчёты AA идут только когда он сработал
+function H.master(cmd)
+    local md = H.md
+    local ms_ = M.h_delay:get()
+    local tick = globals.tickcount
+    if tick < md.last then md.last = 0 end
+    if ms_ <= 0 then
+        md.fire, md.last = true, tick
+        return
+    end
+    local need = math.max(1, math.ceil(ms_ / (H.ti * 1000)))
+    if choked(cmd) == 0 and tick - md.last >= need then
+        md.last, md.fire = tick, true
+    else
+        md.fire = false
+    end
+end
+
+-- Anti-Bruteforce: 1-й промах -> фаза 1, 2-й -> фаза 2 ... по кругу до 5; сброс при нашем попадании
+function H.bf_step()
+    local b = H.bf
+    if not M.h_bfon:get() then b.idx, b.miss, b.imp, b.hurt = 0, 0, false, false return end
+    local imp, hurt = b.imp, b.hurt
+    b.imp, b.hurt = false, false
+    if imp and not hurt then
+        b.miss = b.miss + 1
+        b.idx = ((b.miss - 1) % 5) + 1
+        b.t = globals.realtime
+        eng.bf_flip = true
+        H.log_push("hit", string.format("enemy miss #%d  forced phase %d (%+d°)", b.miss, b.idx,
+            math.floor(M.h_bf[b.idx]:get())))
+    end
+end
+
+-- Body Yaw Modifier + Bruteforce offset + Anti-Massive Fake
+function H.apply_hyper(cmd, lp, base_yaw)
+    if manual_dir ~= 0 then return end
+    local md, am, b = H.md, H.am, H.bf
+    local mode = M.h_mod:get()
+    local tick, now = globals.tickcount, globals.realtime
+
+    if md.fire then
+        if mode ~= "Disabled" then
+            local range = M.h_range:get()
+            local cn = cmd.command_number or tick
+            if mode == "Fixed Jitter" then
+                -- аппаратная инверсия +range / -range на каждый запуск таймера (не залипает при любом delay)
+                md.jpos = not md.jpos
+                md.jit = md.jpos and range or -range
+                md.jside = md.jpos
+            elseif mode == "True Random Jitter" then
+                -- никогда около нуля: модуль в диапазоне [35%..100%] от range
+                local lo = math.max(1, math.floor(range * 0.35))
+                local mag = math.random(lo, math.max(lo, math.floor(range)))
+                md.jpos = math.random() < 0.5
+                md.jit = md.jpos and mag or -mag
+                md.jside = md.jpos
+            else
+                -- Micro-Sway: синусоида по номеру команды
+                local s = math.sin(cn * 0.15)
+                md.jit = s * range
+                md.jside = s >= 0
+            end
+        end
+
+        -- Anti-Massive Fake: следим за desync и за повторными промахами/попаданиями
+        if M.h_antimf:get() then
+            local lby = lp.m_flLowerBodyYawTarget
+            if lby then
+                local delta = math.abs(norm_yaw(cmd.view_angles.y - lby))
+                if delta > 62 and delta < 178 then am.untl = math.max(am.untl, now + 1.2) end
+            end
+            if b.miss >= 2 and now - b.t < 3 then am.untl = math.max(am.untl, now + 1.5) end
+            if tick < am.last then am.last = 0 end
+            if now < am.untl and tick - am.last >= am.wait then
+                am.last = tick
+                am.wait = rint(2, 4)
+                am.side = not am.side
+            end
+        end
+    end
+
+    local massive = M.h_antimf:get() and now < am.untl
+    local bfo = (b.idx > 0 and M.h_bfon:get()) and M.h_bf[b.idx]:get() or 0
+
+    if mode ~= "Disabled" or bfo ~= 0 then
+        local yaw = base_yaw
+        if mode ~= "Disabled" then yaw = yaw + md.jit end
+        yaw = yaw + bfo
+        ovr(R.yaw_offset, norm_yaw(yaw))
+    end
+    if mode ~= "Disabled" or massive then
+        ovr(R.body_yaw, true); ovr(R.body_options, {})
+        ovr(R.inverter, massive and am.side or md.jside)
+    end
+end
+
+-- ========== ГЛАВНАЯ ФУНКЦИЯ АНТИ-АИМА ==========
+local function apply_antiaim(cmd, lp)
+    track_defensive(lp)
+    update_manual()
+
+    local raw, on_ground = get_state(cmd, lp)
+    cur_raw = raw
+    if on_ground then air.ticks = 0 else air.ticks = air.ticks + 1 end
+
+    local team = lp.m_iTeamNum
+    local bs = resolve(Bs, team, raw)
+    local ds = resolve(Ds, team, raw)
+    local tick = globals.tickcount
+    cur_bs = bs
+
+    clear_hidden()
+    H.master(cmd)
+    if H.md.fire then
+        bf_step()
+        H.bf_step()
+        engine_tick(cmd, bs)
+    end
+    update_freestanding(lp, raw)
+    local blk = active_block(bs)
+
+    -- ----- основной AA из Builder -----
+    local base_yaw = 0
+    if bs then
+        ovr(R.pitch, "Down"); ovr(R.yaw, "Backward")
+        ovr(R.yaw_base, M.yaw_base:get()); ovr(R.freestanding, false)
+        ovr(R.modifier, "Disabled")
+        if H.md.fire or not H.md.yaw then H.md.yaw = compute_yaw(blk, tick) end
+        base_yaw = H.md.yaw
+        ovr(R.yaw_offset, norm_yaw(manual_dir ~= 0 and manual_dir or base_yaw))
+        apply_body(blk, cmd)
+        H.apply_hyper(cmd, lp, base_yaw)
+    end
+
+    -- ----- defensive из вкладки Defensive -----
+    apply_defensive(ds, cmd)
+
+    -- ----- эксплойты (последний побеждает) -----
+    local need_def = ds ~= nil
+    if manual_dir == 0 then
+        if E.ex:get() and state_ok(E.ex_states, raw) then module_extended(cmd, base_yaw) end
+        if E.sk:get() and state_ok(E.sk_states, raw) then module_antiskeet(cmd, base_yaw) end
+        if E.mf:get() and state_ok(E.mf_states, raw) then
+            module_massive(cmd, base_yaw)
+            if E.mf_style:get() == "Defensive flick" then need_def = true end
+        end
+        if E.sc:get() and state_ok(E.sc_states, raw) then module_scoliosis(cmd, base_yaw); need_def = true end
+        if E.ff:get() and state_ok(E.ff_states, raw) then
+            module_flick(cmd, base_yaw)
+            if E.ff_mode:get() == "Defensive" then need_def = true end
+        end
+    end
+
+    -- ----- air lag / форсирование defensive -----
+    local air_force = apply_air_lag(cmd, lp, raw)
+    set_defensive(cmd, need_def or air_force)
+    apply_fakeflick(cmd, raw)
+
+    -- ----- Random Fakelag (пока air lag не занят) -----
+    local air_busy = E.al:get() and raw == 5
+    if M.rfl:get() and not air_busy then
+        if choked(cmd) == 0 then
+            rfl.limit = rint(M.rfl_min:get(), M.rfl_max:get())
+        end
+        ovr(R.fl_enable, true); ovr(R.fl_limit, rfl.limit)
+    elseif not air_busy then
+        ovr(R.fl_limit)
+    end
+
+    apply_specials(lp, raw)
+
+    -- Legit AA on use: пока зажата E и рядом нет бомбы/заложника — смотрим назад, E не нажимается
+    if M.legit_use:get() and cmd.in_use and not AAX.near_objective(lp) then
+        overwrite("Legit")
+        pcall(function() cmd.in_use = false end)
+    end
+
+    apply_air_stop(cmd, lp, raw)
+    apply_air_hitchance(raw)
+
+    if R.edge then
+        ovr(R.edge, (M.edge:get() and R.fakeduck and R.fakeduck:get()) or false)
+    end
+
+    eng.flipped = false
+end
+
+-- ========== БЫСТРАЯ ЛЕСТНИЦА ==========
+local function fast_ladder(cmd, lp)
+    if lp.m_MoveType ~= 9 then return end
+    local pitch = render.camera_angles().x
+    local va = cmd.view_angles
+    va.y = math.floor(va.y + 0.5)
+
+    if cmd.forwardmove == 0 and cmd.sidemove ~= 0 then
+        va.x = 89; va.y = va.y + 180
+        cmd.in_moveleft = cmd.sidemove > 0
+        cmd.in_moveright = cmd.sidemove < 0
+    end
+    if cmd.forwardmove > 0 and pitch < 45 then
+        va.x = 89
+        cmd.in_moveright, cmd.in_moveleft = true, false
+        cmd.in_forward, cmd.in_back = false, true
+        va.y = va.y + (cmd.sidemove == 0 and 90 or (cmd.sidemove < 0 and 150 or 30))
+    end
+    if cmd.forwardmove < 0 then
+        va.x = 89
+        cmd.in_moveleft, cmd.in_moveright = true, false
+        cmd.in_forward, cmd.in_back = true, false
+        va.y = va.y + (cmd.sidemove == 0 and 90 or (cmd.sidemove > 0 and 150 or 30))
+    end
+end
+
+-- ========== ТЕМА: ПАНЕЛИ, GLOW ==========
+local function theme()
+    local glow_amt = M.glow:get() and M.glow_amt:get() or 0
+    return M.c_logo:get(), M.c_text:get(), M.c_bg:get(), M.c_glow:get(), glow_amt
+end
+
+local function glow_rect(p1, p2, col, amt, rounding)
+    if amt <= 0 then return end
+    local a = math.floor(clamp(col.a * amt / 100 * 0.75, 0, 255))
+    if a <= 0 then return end
+    pcall(render.shadow, p1, p2, color(col.r, col.g, col.b, a), math.floor(10 + amt * 0.2), 0, rounding or 6)
+end
+
+-- Панель: свечение + фон + тонкая рамка. a — прозрачность 0..1
+local function panel(x, y, w, h, a, edge, rounding)
+    local logo, _, bg, glowc, amt = theme()
+    edge = edge or logo
+    rounding = rounding or 8
+    local p1, p2 = vector(x, y), vector(x + w, y + h)
+    glow_rect(p1, p2, color(glowc.r, glowc.g, glowc.b, math.floor(glowc.a * a)), amt, rounding)
+    render.rect(p1, p2, color(bg.r, bg.g, bg.b, math.floor(bg.a * a)), rounding)
+    pcall(render.rect_outline, p1, p2, color(edge.r, edge.g, edge.b, math.floor(70 * a)), 1, rounding)
+end
+
+-- ----- строка лога в стиле скрина: [ТЕГ] ник  сегменты..., каждая строка по центру экрана -----
+-- row = { {текст, роль, [цвет]}, ... }; роли: tag (цвет), name, txt, dim
+function H.draw_row(row, scrx, y, a)
+    local _, txt = theme()
+    local gap, total = 8, 0
+    local ws = {}
+    for i = 1, #row do
+        local font = (row[i][2] == "tag" or row[i][2] == "name") and H.fb or H.fs
+        ws[i] = text_width(row[i][1], font)
+        total = total + ws[i]
+    end
+    total = total + gap * (#row - 1)
+    local x = math.floor(scrx / 2 - total / 2)
+    for i = 1, #row do
+        local seg = row[i]
+        local role = seg[2]
+        local font = (role == "tag" or role == "name") and H.fb or H.fs
+        local col
+        if role == "tag" then col = seg[3] or txt
+        elseif role == "name" then col = txt
+        elseif role == "dim" then col = color(txt.r, txt.g, txt.b, 150)
+        else col = color(txt.r, txt.g, txt.b, 220) end
+        local text = tostring(seg[1])
+        render.text(font, vector(x + 1, y + 1), color(0, 0, 0, math.floor(190 * a)), "", text)
+        render.text(font, vector(x, y), color(col.r, col.g, col.b, math.floor(col.a * a)), "", text)
+        x = x + ws[i] + gap
+    end
+end
+
+-- строка для обычных уведомлений (info и т.п.), если у них нет готовой row
+function H.row_of(kind, d, logo)
+    if d.row then return d.row end
+    local c = (kind == "miss") and H.MISSC or logo
+    local row = {{d.title or "", "tag", c}, {d.name or "", "name"}}
+    if d.detail and d.detail ~= "" then row[#row + 1] = {d.detail, "dim"} end
+    return row
+end
+
+-- ========== RESOLVER ==========
+-- Что делает:
+--  1) определяет сторону desync: по бегу / LBY на месте / по фазе джиттера eye yaw;
+--  2) ловит LBY flick (на месте eye yaw и LBY расходятся → в момент обновления LBY берём полный угол);
+--  3) масштабирует амплитуду по скорости и приседанию, как это делает animstate (адаптивная амплитуда);
+--  4) помнит, какой угол сработал, отдельно для «стоит/идёт/в воздухе» и для каждой фазы джиттера;
+--  5) после промахов не повторяет уже провальные углы, а идёт по списку кандидатов.
+-- Результат пишется в body-yaw pose parameter (11).
+-- Работает при включённом «Resolver» или «Assist Base Resolver».
+local RES = {data = {}, miss_reasons = {resolver = true, correction = true, unknown = true}}
+
+local function res_key(c) return string.format("%.2f", c) end
+
+function RES.get(pl)
+    local id = safe(function() return pl:get_index() end, nil)
+    if not id then return nil end
+    local d = RES.data[id]
+    if not d then
+        d = {miss = 0, side = 1, mult = 0, eye = 0, lby = 0, deltas = {}, eyes = {}, jit = false, phase = 1,
+             center = 0, bad = {}, mem = {}, flick_until = 0, flick_mult = 0, key = "stand", amp = 1, streak = 0,
+             score = {}, flip_tick = 0, intervals = {}, period = nil, last_phase = 1, pphase = 1}
+        RES.data[id] = d
+    end
+    return d
+end
+
+-- множитель максимального угла по скорости и приседанию (как в animstate CS:GO)
+function RES.amp_scale(pl, speed)
+    local frac = clamp(speed / 260, 0, 1)
+    local m = 1 - 0.5 * frac
+    local duck = safe(function() return pl.m_flDuckAmount end, 0)
+    if duck > 0 then m = m + duck * clamp(speed / 82, 0, 1) * (0.5 - m) end
+    return clamp(m, 0.35, 1)
+end
+
+-- список кандидатов от самого вероятного к менее вероятному
+function RES.candidates(guess, aggressive)
+    if aggressive then
+        return {guess, -guess, guess * 0.6, -guess * 0.6, 0, guess * 0.3, -guess * 0.3}
+    end
+    return {guess, -guess, guess * 0.5, -guess * 0.5, 0, guess * 0.75, -guess * 0.75, guess * 0.25, -guess * 0.25}
+end
+
+-- выбираем кандидата с лучшим накопленным счётом (попадание +2, промах −1), уже проваленные пропускаем
+function RES.pick(d, guess, aggressive, mkey)
+    local sc = d.score[mkey or ""] or {}
+    local best, best_v = nil, -1000000000
+    for i, c in ipairs(RES.candidates(guess, aggressive)) do
+        local k = res_key(c)
+        if not d.bad[k] then
+            local v = (sc[k] or 0) - i * 0.01
+            if v > best_v then best, best_v = c, v end
+        end
+    end
+    if best then return best end
+    d.bad = {}
+    return guess
+end
+
+function RES.compute(pl, d)
+    local eye = safe(function() return pl.m_angEyeAngles.y end, nil)
+    if not eye then return end
+    local tick = globals.tickcount
+
+    -- ----- история eye yaw: джиттер, центр, фаза -----
+    local delta = norm_yaw(eye - d.eye)
+    d.eye = eye
+    table.insert(d.deltas, delta)
+    if #d.deltas > 8 then table.remove(d.deltas, 1) end
+    table.insert(d.eyes, eye)
+    if #d.eyes > 8 then table.remove(d.eyes, 1) end
+
+    local flips = 0
+    for i = 2, #d.deltas do
+        local a, b = d.deltas[i - 1], d.deltas[i]
+        if math.abs(a) > 12 and math.abs(b) > 12 and a * b < 0 then flips = flips + 1 end
+    end
+    d.jit = M.res_jit:get() and flips >= 3
+
+    -- центр джиттера: среднее смещений относительно первого значения (без проблем на переходе ±180)
+    local base, acc = d.eyes[1], 0
+    for i = 1, #d.eyes do acc = acc + norm_yaw(d.eyes[i] - base) end
+    d.center = norm_yaw(base + acc / #d.eyes)
+    d.phase = (norm_yaw(eye - d.center) >= 0) and 1 or -1
+
+    -- период джиттера: считаем тики между сменами фазы и предсказываем фазу на следующий тик
+    if d.phase ~= d.last_phase then
+        local iv = tick - d.flip_tick
+        if d.flip_tick > 0 and iv > 0 and iv < 40 then
+            table.insert(d.intervals, iv)
+            if #d.intervals > 5 then table.remove(d.intervals, 1) end
+            local sum = 0
+            for _, v in ipairs(d.intervals) do sum = sum + v end
+            d.period = sum / #d.intervals
+        end
+        d.flip_tick, d.last_phase = tick, d.phase
+    end
+    local ph = d.phase
+    if d.jit and d.period and (tick - d.flip_tick + 1) >= d.period then ph = -ph end
+    d.pphase = ph
+
+    -- ----- скорость, состояние, сторона -----
+    local vel = safe(function() return pl.m_vecVelocity end, nil)
+    local speed = vel and vel:length2d() or 0
+    local flags = safe(function() return pl.m_fFlags end, 1)
+    local on_ground = bit.band(flags, 1) == 1
+
+    if not on_ground then d.key = "air"
+    elseif speed > 20 then d.key = "move"
+    else d.key = "stand" end
+
+    local lby = safe(function() return pl.m_flLowerBodyYawTarget end, eye)
+    local lby_changed = math.abs(norm_yaw(lby - d.lby)) > 1
+    d.lby = lby
+
+    if speed > 20 and vel then
+        local move_yaw = math.deg(math.atan2(vel.y, vel.x))
+        local diff = norm_yaw(eye - move_yaw)
+        if math.abs(diff) > 3 then d.side = diff >= 0 and 1 or -1 end
+    else
+        local diff = norm_yaw(eye - lby)
+        if math.abs(diff) > 5 then d.side = diff >= 0 and 1 or -1 end
+    end
+
+    -- ----- LBY flick: обновление LBY на месте → реальный угол = LBY -----
+    if M.res_flick:get() and d.key == "stand" and lby_changed then
+        local diff = norm_yaw(eye - lby)
+        if math.abs(diff) > 15 then
+            d.flick_until = tick + 2
+            d.flick_mult = (diff >= 0 and 1 or -1)
+        end
+    end
+
+    -- ----- итоговый угол -----
+    local mode = M.res_mode:get()
+    local aggressive = mode == "Aggressive"
+    -- на джиттере сторона привязана к фазе eye yaw
+    local guess = d.side
+    if d.jit then guess = d.pphase * (d.side >= 0 and 1 or -1) end
+
+    local mkey = d.key .. (d.jit and (d.pphase > 0 and ":p" or ":n") or "")
+    local mult
+    if mode ~= "Brute" and tick < d.flick_until then
+        mult = d.flick_mult
+    elseif mode ~= "Brute" and M.res_mem:get() and d.mem[mkey] ~= nil and d.streak < (aggressive and 1 or 2) then
+        mult = d.mem[mkey]
+    elseif mode == "Brute" then
+        mult = RES.pick(d, 1, false, mkey)
+    else
+        mult = RES.pick(d, guess, aggressive, mkey)
+    end
+
+    d.mult = mult
+    d.mkey = mkey
+    d.amp = M.res_amp:get() and RES.amp_scale(pl, speed) or 1
+end
+
+function RES.apply(pl, d)
+    pcall(function()
+        pl.m_flPoseParameter[11] = clamp(0.5 + d.mult * d.amp * M.res_max:get() / 116, 0, 1)
+    end)
+end
+
+function RES.run(compute)
+    -- встроенный резольвер Neverlose мешает: пока наш включён, глушим его (если пункт найден)
+    -- в режиме Assist Base Resolver встроенный НЕ отключается
+    local want_off = M.enable:get() and M.res:get() and M.res_native:get()
+    if R.native_res then
+        if want_off then ovr(R.native_res, false); RES.native_ovr = true
+        elseif RES.native_ovr then ovr(R.native_res); RES.native_ovr = false end
+    end
+
+    if not (M.enable:get() and H.res_on()) then return end
+    local lp = entity.get_local_player()
+    if not lp or not lp:is_alive() then return end
+    for _, pl in ipairs(safe(function() return entity.get_players(true) end, {})) do
+        if safe(function() return pl:is_alive() end, false) and not safe(function() return pl:is_dormant() end, true) then
+            local d = RES.get(pl)
+            if d then
+                if compute then RES.compute(pl, d) end
+                RES.apply(pl, d)
+            end
+        end
+    end
+end
+
+-- снимок на момент выстрела (мы запоминаем, чем именно стреляли)
+function RES.snap(target)
+    if not (H.res_on() and target) then return nil end
+    local d = RES.get(target)
+    if not d then return nil end
+    return {mult = d.mult, key = d.mkey}
+end
+
+function RES.feedback(target, hit, reason, shot)
+    if not (H.res_on() and target) then return end
+    local d = RES.get(target)
+    if not d then return end
+    local used = shot and shot.mult or d.mult
+    local key = shot and shot.key or d.mkey
+
+    local sc = d.score[key or ""]
+    if not sc then sc = {}; d.score[key or ""] = sc end
+    local uk = res_key(used)
+
+    if hit then
+        d.miss, d.streak, d.bad = 0, 0, {}
+        if key then d.mem[key] = used end
+        sc[uk] = clamp((sc[uk] or 0) + 2, -5, 12)
+    elseif RES.miss_reasons[reason] then
+        d.miss, d.streak = d.miss + 1, d.streak + 1
+        d.bad[uk] = true
+        sc[uk] = clamp((sc[uk] or 0) - 1, -5, 12)
+        if key and d.mem[key] == used then d.mem[key] = nil end
+    end
+end
+
+function RES.info(target)
+    if not (H.res_on() and M.res_log:get() and target) then return "" end
+    local d = RES.get(target)
+    if not d then return "" end
+    return string.format("  ·  res %+d° m%d %s%s", math.floor(d.mult * d.amp * M.res_max:get()), d.miss, d.key or "",
+        d.jit and " jit" or "")
+end
+
+on("net_update_end", function() RES.run(true) end)
+
+-- ========== ЛОГИ И УВЕДОМЛЕНИЯ ==========
+local HITBOXES = {[0] = "generic", "head", "chest", "stomach", "left arm", "right arm", "left leg", "right leg", "neck", "?", "gear"}
+local RED  = color(255, 100, 100, 255)
+local GRAY = color(134, 134, 134, 255)
+
+local notifs, NOTIF_MAX = {}, 6
+
+-- kind: "hit" | "miss" | "info"; d = {title, name, hitbox, badge, detail, row}
+notify = function(kind, d)
+    local life = M.log_time and M.log_time:get() or 4
+    table.insert(notifs, {kind = kind, d = d, born = globals.realtime, life = life, y = nil})
+    if #notifs > NOTIF_MAX then table.remove(notifs, 1) end
+end
+
+local STYLE_H = {Modern = 32, Minimal = 18, Card = 46}
+
+local function ease_out(t) t = clamp(t, 0, 1); return 1 - (1 - t) ^ 3 end
+
+-- логотип Lethe: скруглённый значок с буквой L цветом логотипа
+local function draw_logo(x, y, size, a)
+    local lc = M.c_logo:get()
+    local p1, p2 = vector(x, y), vector(x + size, y + size)
+    render.rect(p1, p2, color(lc.r, lc.g, lc.b, math.floor(60 * a)), size / 3)
+    pcall(render.rect_outline, p1, p2, color(lc.r, lc.g, lc.b, math.floor(170 * a)), 1, size / 3)
+    local tw = render.measure_text(1, "", "L").x
+    render.text(1, vector(x + size / 2 - tw / 2, y + size / 2 - 7), color(lc.r, lc.g, lc.b, math.floor(255 * a)), "", "L")
+end
+
+local function draw_notifs()
+    local sh = render.screen_size()
+    local logo, txt, _, glowc, amt = theme()
+    local style = M.log_style:get()
+    local now, dt = globals.realtime, globals.frametime
+
+    for i = #notifs, 1, -1 do
+        if now - notifs[i].born > notifs[i].life then table.remove(notifs, i) end
+    end
+
+    -- стиль Table: строки по центру внизу экрана, новые снизу (как на скрине)
+    if style == "Table" then
+        local total = #notifs
+        for i, n in ipairs(notifs) do
+            local age = now - n.born
+            local a = 1
+            if age < 0.2 then a = age / 0.2
+            elseif age > n.life - 0.4 then a = (n.life - age) / 0.4 end
+            a = clamp(a, 0, 1)
+            H.draw_row(H.row_of(n.kind, n.d, logo), sh.x, sh.y - 74 - (total - i) * 18, a)
+        end
+        return
+    end
+
+    local h = STYLE_H[style] or 32
+    local gap = (style == "Minimal") and 2 or 8
+    local total = #notifs
+
+    for i, n in ipairs(notifs) do
+        local age = now - n.born
+        local a = 1
+        if age < 0.2 then a = age / 0.2
+        elseif age > n.life - 0.3 then a = (n.life - age) / 0.3 end
+        a = clamp(a, 0, 1)
+        local slide = 1 - ease_out(age / 0.3)
+
+        local kc = (n.kind == "miss") and RED or logo
+        local dimc = color(txt.r, txt.g, txt.b, 150)
+        local function C(c, mult) return color(c.r, c.g, c.b, math.floor(c.a * a * (mult or 1))) end
+        local d = n.d
+        local title, name, hitbox, badge, detail = d.title or "", d.name or "", d.hitbox or "", d.badge or "", d.detail or ""
+
+        local base_y = (style == "Card") and (sh.y * 0.66) or (sh.y - 90)
+        local ty = base_y - (total - i) * (h + gap)
+        n.y = n.y and lerp(n.y, ty, clamp(dt * 12, 0, 1)) or (ty + 10)
+        local y = math.floor(n.y)
+
+        if style == "Modern" then
+            -- капсула: лого · ник · хитбокс · бейдж
+            local wn = text_width(name)
+            local wh = hitbox ~= "" and text_width(hitbox) or 0
+            local bw = badge ~= "" and (text_width(badge) + 18) or 0
+            local w = 40 + wn + (wh > 0 and (wh + 14) or 0) + (bw > 0 and (bw + 12) or 0) + 8
+            local x = sh.x / 2 - w / 2
+            y = y + math.floor(slide * 10)
+
+            panel(x, y, w, h, a, kc, h / 2)
+            draw_logo(x + 6, y + (h - 22) / 2, 22, a)
+            render.text(1, vector(x + 38, y + h / 2 - 7), C(txt), "", name)
+            local cx = x + 38 + wn
+            if wh > 0 then
+                render.text(1, vector(cx + 12, y + h / 2 - 7), C(dimc), "", hitbox)
+                cx = cx + 12 + wh
+            end
+            if bw > 0 then
+                local bx = x + w - 8 - bw
+                render.rect(vector(bx, y + 6), vector(bx + bw, y + h - 6), C(kc, 0.2), 10)
+                render.text(1, vector(bx + 9, y + h / 2 - 7), C(kc), "", badge)
+            end
+
+        elseif style == "Minimal" then
+            -- строка с брендом: lethe · ник · хитбокс · бейдж
+            local brand = "lethe"
+            local plain = brand .. "   " .. name .. (hitbox ~= "" and ("   " .. hitbox) or "") .. (badge ~= "" and ("   " .. badge) or "")
+            local colored = esc(logo, math.floor(logo.a * a)) .. brand .. "   "
+                .. esc(txt, math.floor(txt.a * a)) .. name
+                .. esc(dimc, math.floor(dimc.a * a)) .. (hitbox ~= "" and ("   " .. hitbox) or "")
+                .. esc(kc, math.floor(kc.a * a)) .. (badge ~= "" and ("   " .. badge) or "")
+            local w = text_width(plain)
+            local x = sh.x / 2 - w / 2
+            y = y + math.floor(slide * 8)
+
+            glow_rect(vector(x - 4, y + 2), vector(x + w + 4, y + h - 2), color(glowc.r, glowc.g, glowc.b, math.floor(glowc.a * a)), amt * 0.45, 6)
+            render.text(1, vector(x + 1, y + 1), color(0, 0, 0, math.floor(160 * a)), "", plain)
+            render.text(1, vector(x, y), color(255, 255, 255, math.floor(255 * a)), "", colored)
+
+        else
+            -- карточка слева: лого · тег · ник · бейдж, снизу детали
+            local tw = text_width(title) + 16
+            local cx0 = 50
+            local l1 = cx0 + tw + 10 + text_width(name) + (badge ~= "" and (24 + text_width(badge)) or 0)
+            local line2 = hitbox .. (detail ~= "" and (hitbox ~= "" and "   ·   " or "") .. detail or "")
+            local l2 = cx0 + text_width(line2)
+            local w = math.max(230, l1, l2) + 16
+            local x = 20 - math.floor(slide * 40)
+
+            panel(x, y, w, h, a, kc, 10)
+            render.rect(vector(x + 1, y + 10), vector(x + 4, y + h - 10), C(kc), 2)
+            draw_logo(x + 12, y + (h - 26) / 2, 26, a)
+            render.rect(vector(x + cx0, y + 8), vector(x + cx0 + tw, y + 26), C(kc, 0.2), 7)
+            render.text(1, vector(x + cx0 + 8, y + 10), C(kc), "", title)
+            render.text(1, vector(x + cx0 + tw + 10, y + 10), C(txt), "", name)
+            if badge ~= "" then
+                render.text(1, vector(x + w - 14 - text_width(badge), y + 10), C(kc), "", badge)
+            end
+            if line2 ~= "" then render.text(1, vector(x + cx0, y + 29), C(dimc), "", line2) end
+        end
+    end
+end
+
+local function console_log(parts)
+    local line = ""
+    for _, p in ipairs(parts) do line = line .. esc(p[1]) .. p[2] end
+    if not pcall(print_raw, line) then
+        local plain = ""
+        for _, p in ipairs(parts) do plain = plain .. p[2] end
+        print(plain)
+    end
+end
+
+-- Hyper-логгер: экран (4 сек с затуханием) + консоль (в этой сборке выключен: M.h_log = false)
+function H.log_push(kind, text)
+    if not M.h_log:get() then return end
+    local l = H.logs
+    l[#l + 1] = {kind = kind, text = text, born = globals.realtime}
+    if #l > 7 then table.remove(l, 1) end
+    console_log({{H.CYAN, "hyper"}, {GRAY, "  »  "}, {kind == "miss" and H.NRED or H.CYAN, text}})
+end
+
+local fired = {}
+
+on("aim_fire", function(e)
+    local lp = entity.get_local_player()
+    fired[e.id] = {total_hits = safe(function() return lp.m_totalHitsOnServer end, 0), res = RES.snap(e.target)}
+    if fired[e.id - 64] then fired[e.id - 64] = nil end
+end)
+
+on("aim_ack", function(e)
+    local lp = entity.get_local_player()
+    local target = e.target
+    local logo, txt = theme()
+    local out = M.logs:get() and M.log_out:get() or {}
+
+    local name = safe(function() return target:get_name() end, "unknown")
+    local hc   = math.floor(safe(function() return e.hitchance end, 0) + 0.5)
+    local bt   = safe(function() return e.backtrack end, 0)
+    local wdmg = safe(function() return e.wanted_damage end, 0)
+    local whg  = HITBOXES[safe(function() return e.wanted_hitgroup end, 0)] or "?"
+    local safety = safe(function() return e.safety end, 0)
+    local dim = GRAY
+    local detail = "hc " .. hc .. "%  ·  bt " .. tostring(bt) .. "t  ·  safe " .. tostring(safety) .. RES.info(target)
+    local hcbt = "HC " .. hc .. "%  BT " .. tostring(bt) .. "t"
+
+    if e.state == nil then
+        stats.hit = stats.hit + 1
+        RES.feedback(target, true, nil, fired[e.id] and fired[e.id].res)
+        local hg    = HITBOXES[safe(function() return e.hitgroup end, 0)] or "?"
+        local dmg   = safe(function() return e.damage end, 0)
+        local hp    = math.max(0, safe(function() return target.m_iHealth end, 0))
+        local alive = hp > 0
+
+        -- Hyper: лог с фазой и сброс индекса bruteforce при нашем попадании
+        H.log_push("hit", string.format("%s %s | %s | %s dmg | phase %d", alive and "hit" or "killed", name, hg,
+            tostring(math.floor(dmg)), H.bf.idx))
+        H.bf.idx, H.bf.miss = 0, 0
+
+        -- строка в стиле скрина
+        local mismatch = hg ~= whg
+        local tag, tcol = alive and "HIT" or "KILL", H.GREEN
+        if mismatch then tag, tcol = "MISMATCH", H.ORANGE end
+        local row = {
+            {tag, "tag", tcol}, {name, "name"},
+            {math.floor(dmg) .. " dmg / " .. math.floor(hp) .. " hp", "txt"},
+            {hg, "txt"}, {hcbt, "dim"},
+        }
+        if mismatch then row[#row + 1] = {"expected " .. math.floor(wdmg) .. " in " .. whg, "dim"} end
+
+        if has(out, "On Screen") then
+            local d2 = detail
+            if hg ~= whg then d2 = "aimed " .. whg .. "  ·  " .. detail end
+            notify("hit", {
+                title = alive and "HIT" or "KILL", name = name, hitbox = hg,
+                badge = (alive and "" or "KILL ") .. "-" .. dmg, detail = d2, row = row,
+            })
+        end
+        if has(out, "In Console") then
+            local parts = {
+                {logo, "lethe"}, {dim, "  »  "}, {logo, alive and "hit " or "killed "}, {txt, name},
+                {dim, " · "}, {logo, hg},
+            }
+            if hg ~= whg then parts[#parts + 1] = {dim, " (aimed " .. whg .. ")"} end
+            parts[#parts + 1] = {dim, " · "}; parts[#parts + 1] = {logo, tostring(dmg)}; parts[#parts + 1] = {txt, " dmg"}
+            if dmg ~= wdmg then parts[#parts + 1] = {dim, " (wanted " .. tostring(wdmg) .. ")"} end
+            parts[#parts + 1] = {dim, " · " .. detail:gsub("  ·  ", " · ")}
+            console_log(parts)
+        end
+    else
+        local reason = tostring(e.state)
+        if reason ~= "death" then stats.miss = stats.miss + 1 end
+
+        if reason == "?" then
+            reason = "unknown"
+            local f = fired[e.id]
+            if f and f.total_hits ~= safe(function() return lp.m_totalHitsOnServer end, f.total_hits) then
+                reason = "damage rejection"
+            end
+        end
+
+        RES.feedback(target, false, reason, fired[e.id] and fired[e.id].res)
+        H.log_push("miss", string.format("missed %s | %s | %s | phase %d", name, whg, reason, H.bf.idx))
+
+        if has(out, "On Screen") then
+            notify("miss", {
+                title = "MISS", name = name, hitbox = whg, badge = reason, detail = detail,
+                row = {{"MISS", "tag", H.MISSC}, {name, "name"}, {reason, "txt"}, {"hitbox: " .. whg, "dim"}, {hcbt, "dim"}},
+            })
+        end
+        if has(out, "In Console") then
+            console_log({
+                {logo, "lethe"}, {dim, "  »  "}, {RED, "missed "}, {txt, name}, {dim, " · "}, {logo, whg},
+                {dim, " · reason: "}, {RED, reason},
+                {dim, " · " .. detail:gsub("  ·  ", " · ")},
+            })
+        end
+    end
+end)
+
+on("player_connect_full", function(e)
+    if entity.get(e.userid, true) == entity.get_local_player() then
+        stats.hit, stats.miss = 0, 0
+    end
+end)
+
+-- ========== ASPECT RATIO ==========
+local aspect_applied = nil
+local function update_aspect()
+    local want = M.aspect:get() and (M.aspect_val:get() / 100) or 0
+    if want ~= aspect_applied then
+        aspect_applied = want
+        if not pcall(function() cvar.r_aspectratio:float(want) end) then
+            pcall(utils.console_exec, "r_aspectratio " .. want)
+        end
+    end
+end
+
+-- ========== ОТРИСОВКА ==========
+local font_arrow = 1
+do
+    local ok, f = pcall(render.load_font, "Calibri", 26, "b")
+    if ok and f then font_arrow = f end
+end
+
+local function draw_stats()
+    local sh = render.screen_size()
+    local logo, txt = theme()
+    local total = stats.hit + stats.miss
+    local pct = total > 0 and string.format("%.0f%%", stats.hit / total * 100) or "0%"
+    local line = esc(logo) .. "HIT " .. esc(txt) .. stats.hit
+        .. esc(RED) .. "   MISS " .. esc(txt) .. stats.miss
+        .. esc(logo) .. "   " .. esc(txt) .. pct
+    local w = text_width(line) + 20
+    local x, y = 14, sh.y * 0.72
+    panel(x, y, w, 24, 1, nil, 12)
+    render.text(1, vector(x + 10, y + 5), color(255, 255, 255, 255), "", line)
+end
+
+local function dt_charged()
+    local v = safe(function() return rage.exploit:get() end, nil)
+    return v ~= nil and v >= 0.99
+end
+
+local state_names = {"global", "standing", "walking", "running", "in air", "in air + c", "ducking", "ducking + moving"}
+local scoped_off = 0
+
+local function active_module_name()
+    local names = {}
+    if E.ex:get() and state_ok(E.ex_states, cur_raw) then names[#names + 1] = "ext" end
+    if E.sk:get() and state_ok(E.sk_states, cur_raw) then names[#names + 1] = "skeet" end
+    if E.mf:get() and state_ok(E.mf_states, cur_raw) then names[#names + 1] = "massive" end
+    if E.sc:get() and state_ok(E.sc_states, cur_raw) then names[#names + 1] = "scol" end
+    if E.ff:get() and state_ok(E.ff_states, cur_raw) then names[#names + 1] = "flick" end
+    return #names > 0 and table.concat(names, "+") or nil
+end
+
+local function draw_indicators(lp)
+    local scr = render.screen_size()
+    local cx, cy = scr.x / 2, scr.y / 2
+    local scoped = lp.m_bIsScoped
+    scoped = scoped == true or scoped == 1
+    scoped_off = scoped_off + ((scoped and 28 or 0) - scoped_off) * clamp(globals.frametime * 12, 0, 1)
+    local x = cx + scoped_off
+
+    local logo, txt, _, glowc, amt = theme()
+    local dt_on, hs_on = R.dt and R.dt:get(), R.hs and R.hs:get()
+    local fd = R.fakeduck and R.fakeduck:get()
+    local green, red = color(170, 204, 0, 255), color(255, 60, 60, 255)
+
+    if M.ind_style:get() == "Branded" then
+        local w = text_width("lethe")
+        glow_rect(vector(x - w / 2 - 2, cy + 30), vector(x + w / 2 + 2, cy + 38), glowc, amt, 4)
+        draw_text(x, cy + 28, gradient_text("lethe", color(66, 66, 66, 255), logo, -0.4), "c")
+        draw_text(x, cy + 40, state_names[cur_raw], "c", txt)
+        local y = cy + 52
+        local mod = active_module_name()
+        if mod then draw_text(x, y, mod, "c", color(logo.r, logo.g, logo.b, 220)); y = y + 10 end
+        if dt_on then draw_text(x, y, "dt", "c", dt_charged() and txt or red); y = y + 10 end
+        if hs_on then draw_text(x, y, "osaa", "c", txt); y = y + 10 end
+        if fs.active then draw_text(x, y, "fs", "c", txt); y = y + 10 end
+        if eng.phase > 1 then draw_text(x, y, "bf " .. eng.phase, "c", logo); y = y + 10 end
+        if H.bf.idx > 0 then draw_text(x, y, "abf " .. H.bf.idx, "c", logo); y = y + 10 end
+        if fd then draw_text(x, y, "fd", "c", txt) end
+    else
+        local w = text_width("IDEAL YAW")
+        glow_rect(vector(x - w / 2, cy + 32), vector(x + w / 2, cy + 40), glowc, amt, 4)
+        draw_text(x, cy + 30, cur_raw == 4 and "JITTER WALK" or (cur_raw == 3 and "NORMAL YAW" or "IDEAL YAW"), "c", logo)
+
+        local mode = "DYNAMIC"
+        if manual_dir == -90 then mode = "LEFT"
+        elseif manual_dir == 90 then mode = "RIGHT"
+        elseif manual_dir == 180 then mode = "FORWARD"
+        elseif fs.active then mode = "FREESTAND" end
+        draw_text(x, cy + 40, mode, "c", txt)
+
+        local y = cy + 50
+        if dt_on then
+            draw_text(x, y, "DT", "c", dt_charged() and green or red); y = y + 10
+        elseif hs_on then
+            draw_text(x, y, "ONSHOT", "c", green); y = y + 10
+        end
+        if def.active then draw_text(x, y, "DEF", "c", color(255, 201, 38, 255)); y = y + 10 end
+        if E.al:get() and cur_raw == 5 then draw_text(x, y, "AIR", "c", txt) end
+    end
+end
+
+local arrow_alpha = 50
+
+local function draw_arrows()
+    local scr = render.screen_size()
+    local cx, cy = scr.x / 2, scr.y / 2
+    local active = manual_dir == 90 or manual_dir == -90
+    arrow_alpha = arrow_alpha + ((active and 255 or 50) - arrow_alpha) * clamp(globals.frametime * 12, 0, 1)
+
+    local c = M.c_logo:get()
+    local dim = color(125, 125, 125, 125)
+    local lit = color(c.r, c.g, c.b, math.floor(arrow_alpha))
+    render.text(font_arrow, vector(cx - 62, cy - 16 - scoped_off * 0.5), manual_dir == -90 and lit or dim, "", "<")
+    render.text(font_arrow, vector(cx + 46, cy - 16 - scoped_off * 0.5), manual_dir == 90 and lit or dim, "", ">")
+end
+
+-- ----- простые иконки из примитивов (rect / rect_outline / line) -----
+function H.icon(kind, x, cy, col)
+    local function r(x1, y1, x2, y2, rd, outline)
+        local p1, p2 = vector(x + x1, cy + y1), vector(x + x2, cy + y2)
+        if outline then pcall(render.rect_outline, p1, p2, col, 1, rd or 0)
+        else render.rect(p1, p2, col, rd or 0) end
+    end
+    local function ln(x1, y1, x2, y2)
+        pcall(render.line, vector(x + x1, cy + y1), vector(x + x2, cy + y2), col)
+    end
+    if kind == "user" then r(4, -6, 8, -2, 2); r(1, -1, 11, 5, 3)
+    elseif kind == "fps" then r(0, -5, 12, 3, 2, true); r(4, 4, 8, 6, 1)
+    elseif kind == "ping" then r(0, 2, 2, 5); r(3, 0, 5, 5); r(6, -3, 8, 5); r(9, -6, 11, 5)
+    elseif kind == "time" then r(0, -6, 12, 6, 6, true); ln(6, 0, 6, -3); ln(6, 0, 9, 0)
+    elseif kind == "da" then r(0, -6, 12, 6, 6, true); r(5, -1, 7, 1)
+    elseif kind == "yaw" then ln(2, -5, 8, 0); ln(8, 0, 2, 5); ln(3, -5, 9, 0); ln(9, 0, 3, 5)
+    elseif kind == "hit" then r(0, 0, 3, 5); r(4, -3, 7, 5); r(8, -6, 11, 5) end
+end
+
+-- ping: пробуем несколько источников, обновляем раз в 0.5 сек
+function H.get_ping()
+    local now = globals.realtime
+    if now - H.ping_t < 0.5 then return H.ping end
+    H.ping_t = now
+    local lp = entity.get_local_player()
+    local p = lp and safe(function() return entity.get_player_resource().m_iPing[lp:get_index()] end, nil)
+    if not p then
+        p = safe(function()
+            local l = utils.net_channel().latency
+            local v = l[1] or l[0]
+            return v < 1 and v * 1000 or v
+        end, nil)
+    end
+    if p then H.ping = math.floor(p + 0.5) end
+    return H.ping
+end
+
+local function draw_watermark()
+    local scr = render.screen_size()
+    local logo, txt = theme()
+    local items = M.wm_items:get()
+
+    local segs = {}
+    if has(items, "Script name") then segs[#segs + 1] = {kind = "name", text = gradient_text("lethe", logo, color(255, 255, 255, 255), 1)} end
+    if has(items, "Username") then segs[#segs + 1] = {kind = "user", text = username} end
+    if has(items, "FPS") then
+        segs[#segs + 1] = {kind = "fps", text = math.floor(1 / math.max(globals.frametime, 0.001) + 0.5) .. " fps"}
+    end
+    if has(items, "Ping") then segs[#segs + 1] = {kind = "ping", text = H.get_ping() .. " ms"} end
+    if has(items, "Time") then segs[#segs + 1] = {kind = "time", text = safe(function() return os.date("%H:%M") end, "--:--")} end
+    if #segs == 0 then return end
+
+    local pad, gap, ico, h = 9, 14, 14, 24
+    local w = pad * 2 + gap * (#segs - 1)
+    for _, s in ipairs(segs) do
+        s.w = text_width(s.text) + (s.kind ~= "name" and (ico + 4) or 0)
+        w = w + s.w
+    end
+
+    local pos = M.wm_type:get()
+    local x, y
+    if pos == "Top right" then x, y = scr.x - w - 16, 14
+    elseif pos == "Top left" then x, y = 16, 14
+    elseif pos == "Left" then x, y = 20, scr.y / 2
+    elseif pos == "Right" then x, y = scr.x - 20 - w, scr.y / 2
+    else x, y = scr.x / 2 - w / 2, scr.y - 46 end
+
+    panel(x, y, w, h, 1, nil, 8)
+    local cx = x + pad
+    local ic = color(logo.r, logo.g, logo.b, 255)
+    for _, s in ipairs(segs) do
+        if s.kind ~= "name" then
+            H.icon(s.kind, cx, y + h / 2, ic)
+            render.text(1, vector(cx + ico + 4, y + 5), color(txt.r, txt.g, txt.b, 255), "", s.text)
+        else
+            render.text(1, vector(cx, y + 5), color(255, 255, 255, 255), "", s.text)
+        end
+        cx = cx + s.w + gap
+    end
+end
+
+-- ----- левые индикаторы как на скрине: PING / DA / YAW / HIT % -----
+function H.on(ref)
+    if not ref then return false end
+    local v = safe(function() return ref:get() end, false)
+    return v ~= false and v ~= 0 and v ~= nil
+end
+
+function H.draw_side()
+    local items = M.si_items:get()
+    local scr = render.screen_size()
+    local logo, txt = theme()
+    local x, y = 10, math.floor(scr.y * 0.52)
+
+    local function row(kind, label, active)
+        local col = active and logo or color(txt.r, txt.g, txt.b, 110)
+        H.icon(kind, x, y + 7, col)
+        render.text(H.fb, vector(x + 23, y + 1), color(0, 0, 0, 170), "", label)
+        render.text(H.fb, vector(x + 22, y), col, "", label)
+        y = y + 24
+    end
+
+    if has(items, "Ping") then row("ping", "PING", H.on(H.ref.ping)) end
+    if has(items, "Dormant aim") then row("da", "DA", H.on(H.ref.da)) end
+    if has(items, "Yaw") then row("yaw", "YAW", cur_bs ~= nil) end
+    if has(items, "Hit rate") then
+        local total = stats.hit + stats.miss
+        row("hit", "HIT " .. (total > 0 and string.format("%.0f%%", stats.hit / total * 100) or "0%"), total > 0)
+    end
+end
+
+-- ========== CUSTOM CHAT / HUD / SCOREBOARD (по скриншотам) ==========
+local V = {chat = {}, applied = nil, open = false, team = false, t0 = 0, av = {}, th = {}}
+V.f    = safe(function() return render.load_font("Segoe UI", 13, "") end, 1)
+V.fb   = safe(function() return render.load_font("Segoe UI", 13, "b") end, 1)
+V.fs   = safe(function() return render.load_font("Segoe UI", 11, "") end, 1)
+V.fsb  = safe(function() return render.load_font("Segoe UI", 11, "b") end, 1)
+V.fbig = safe(function() return render.load_font("Segoe UI", 24, "b") end, 1)
+V.fmid = safe(function() return render.load_font("Segoe UI", 14, "b") end, 1)
+V.BLUE  = color(150, 195, 255, 255)
+V.CT    = color(125, 175, 240, 255)
+V.TT    = color(238, 208, 125, 255)
+V.WHITE = color(235, 238, 245, 255)
+V.DIM   = color(150, 155, 170, 255)
+V.ICON = {
+    heart  = {".##.##.", "#######", "#######", ".#####.", "..###..", "...#..."},
+    shield = {"#######", "#######", "#######", "#######", ".#####.", "..###..", "...#..."},
+    wallet = {"########", "########", "####..##", "####..##", "########", "########"},
+    skull  = {".#####.", "#######", "#.###.#", "#######", ".#####.", ".#.#.#.", ".#####."},
+}
+
+-- высота строки шрифта (для вертикального центрирования)
+function V.h(font)
+    local h = V.th[font]
+    if not h then
+        h = safe(function() return render.measure_text(font, "", "Ay").y end, 14)
+        V.th[font] = h
+    end
+    return h
+end
+
+-- текст с центровкой по вертикали (cy) и выравниванием l / c / r по x
+function V.tx(font, x, cy, col, text, a, align)
+    a = a or 1
+    text = tostring(text)
+    local w = text_width(text, font)
+    if align == "c" then x = x - w / 2 elseif align == "r" then x = x - w end
+    render.text(font, vector(math.floor(x), math.floor(cy - V.h(font) / 2)),
+        color(col.r, col.g, col.b, math.floor(col.a * a)), "", text)
+end
+
+function V.cut(s, n)
+    if #s <= n then return s end
+    local c = n
+    while c > 0 do
+        local b = s:byte(c + 1)
+        if b and b >= 128 and b < 192 then c = c - 1 else break end
+    end
+    return s:sub(1, c) .. "..."
+end
+
+function V.ln(x1, y1, x2, y2, col)
+    pcall(render.line, vector(x1, y1), vector(x2, y2), col)
+end
+
+-- «стекло»: размытие фона + тёмная полупрозрачная заливка + тонкая светлая рамка
+function V.glass(x, y, w, h, a, rnd, dark)
+    local p1, p2 = vector(x, y), vector(x + w, y + h)
+    rnd = rnd or h / 2
+    pcall(render.blur, p1, p2, 1, a, rnd)
+    render.rect(p1, p2, color(18, 18, 26, math.floor((dark or 120) * a)), rnd)
+    pcall(render.rect_outline, p1, p2, color(255, 255, 255, math.floor(38 * a)), 1, rnd)
+end
+
+function V.pix(x, y, cell, rows, col)
+    for r = 1, #rows do
+        local row = rows[r]
+        for c = 1, #row do
+            if row:sub(c, c) == "#" then
+                local px, py = x + (c - 1) * cell, y + (r - 1) * cell
+                render.rect(vector(px, py), vector(px + cell, py + cell), col, 0)
+            end
+        end
+    end
+end
+
+-- иконка «самолётик» в круге (кнопка отправки)
+function V.plane(cx, cy, col, a)
+    local c = color(col.r, col.g, col.b, math.floor(255 * a))
+    pcall(render.circle, vector(cx, cy), color(col.r, col.g, col.b, math.floor(60 * a)), 11, 0, 1)
+    V.ln(cx - 5, cy + 1, cx + 6, cy - 5, c)
+    V.ln(cx + 6, cy - 5, cx + 2, cy + 6, c)
+    V.ln(cx + 2, cy + 6, cx, cy + 2, c)
+    V.ln(cx, cy + 2, cx - 5, cy + 1, c)
+    V.ln(cx, cy + 2, cx + 6, cy - 5, c)
+end
+
+-- ===================== ЧАТ =====================
+V.CW = 460
+
+on("player_say", function(e)
+    local p = entity.get(e.userid, true)
+    local name = p and safe(function() return p:get_name() end, "?") or "?"
+    local l = V.chat
+    l[#l + 1] = {name = name, text = tostring(e.text or ""), born = globals.realtime}
+    if #l > 8 then table.remove(l, 1) end
+    if p and p == entity.get_local_player() then V.open = false end
+end)
+
+-- поле ввода: Y = ALL, U = TEAM, закрывается по Enter / Esc / через 10 с
+function V.poll_chat()
+    local function down(k) return safe(function() return common.is_button_down(k) end, false) end
+    local y, u, en, es = down(0x59), down(0x55), down(0x0D), down(0x1B)
+    if not V.open then
+        if (y and not V.ky) or (u and not V.ku) then
+            V.open, V.team, V.t0 = true, (u and not y), globals.realtime
+        end
+    elseif (en and not V.ken) or (es and not V.kes) or globals.realtime - V.t0 > 10 then
+        V.open = false
+    end
+    V.ky, V.ku, V.ken, V.kes = y, u, en, es
+end
+
+function V.draw_chat(sh)
+    local now, life, list = globals.realtime, M.vchat_time:get(), V.chat
+    for i = #list, 1, -1 do
+        if now - list[i].born > life then table.remove(list, i) end
+    end
+    local x = 24
+    local iy = sh.y - 64 - 36 - 40          -- слот поля ввода (над плашкой денег)
+    local show_input = M.vchat_input:get() and V.open
+
+    if show_input then
+        V.glass(x, iy, V.CW, 34, 1)
+        local label = V.team and "TEAM" or "ALL"
+        V.tx(V.fsb, x + 16, iy + 17, V.BLUE, label)
+        local cx = x + 16 + text_width(label, V.fsb) + 14
+        if math.floor(now * 2) % 2 == 0 then
+            render.rect(vector(cx, iy + 9), vector(cx + 1, iy + 25), V.WHITE, 0)
+        end
+        V.plane(x + V.CW - 22, iy + 17, V.BLUE, 1)
+    end
+
+    local base = show_input and (iy - 34) or (iy + 6)
+    for i = #list, 1, -1 do
+        local m = list[i]
+        local age = now - m.born
+        local a = clamp(math.min(age / 0.2, (life - age) / 0.5), 0, 1)
+        local y = base - (#list - i) * 34
+        V.glass(x, y, V.CW, 28, a)
+        local label = V.cut(m.name, 26) .. " :"
+        V.tx(V.fb, x + 16, y + 14, V.BLUE, label, a)
+        V.tx(V.f, x + 16 + text_width(label, V.fb) + 8, y + 14, V.WHITE, V.cut(m.text, 80), a)
+    end
+end
+
+-- ===================== HUD =====================
+-- дуга под плашкой здоровья: идёт по нижним закруглениям и прямой между ними
+function V.arc_points(x, y, w, h, off)
+    local r, pts = h / 2, {}
+    local function arc(cx, cy, a0, a1)
+        for i = 0, 8 do
+            local a = math.rad(lerp(a0, a1, i / 8))
+            pts[#pts + 1] = {cx + math.cos(a) * (r + off), cy + math.sin(a) * (r + off)}
+        end
+    end
+    arc(x + r, y + r, 165, 90)
+    arc(x + w - r, y + r, 90, 15)
+    return pts
+end
+
+function V.draw_hud(lp, sh)
+    local hp = math.max(0, safe(function() return lp.m_iHealth end, 0))
+    local ar = math.max(0, safe(function() return lp.m_ArmorValue end, 0))
+    local money = safe(function() return lp.m_iAccount end, 0)
+    local x, hy = 24, sh.y - 64
+    local my = hy - 36
+
+    -- деньги
+    local mt = "$" .. money
+    V.glass(x, my, 14 + 16 + 8 + text_width(mt, V.fb) + 16, 28, 1)
+    V.pix(x + 14, my + 8, 2, V.ICON.wallet, V.BLUE)
+    V.tx(V.fb, x + 14 + 16 + 8, my + 14, V.WHITE, mt)
+
+    -- здоровье + дуга снизу
+    local ht = tostring(hp)
+    local hw = 16 + 21 + 10 + text_width(ht, V.fbig) + 18
+    V.glass(x, hy, hw, 42, 1)
+    V.pix(x + 16, hy + 12, 3, V.ICON.heart, V.BLUE)
+    V.tx(V.fbig, x + 16 + 21 + 10, hy + 21, V.WHITE, ht)
+    local pts = V.arc_points(x, hy, hw, 42, 3)
+    local n = #pts - 1
+    local k = math.floor(n * clamp(hp / 100, 0, 1) + 0.5)
+    for i = 1, k do
+        V.ln(pts[i][1], pts[i][2], pts[i + 1][1], pts[i + 1][2], V.BLUE)
+        V.ln(pts[i][1], pts[i][2] + 1, pts[i + 1][1], pts[i + 1][2] + 1, V.BLUE)
+    end
+
+    -- броня
+    local at = tostring(ar)
+    local aw = 16 + 21 + 10 + text_width(at, V.fbig) + 18
+    local ax = x + hw + 10
+    V.glass(ax, hy, aw, 42, 1)
+    V.pix(ax + 16, hy + 10, 3, V.ICON.shield, V.BLUE)
+    V.tx(V.fbig, ax + 16 + 21 + 10, hy + 21, V.WHITE, at)
+end
+
+-- ===================== СКОРБОРД =====================
+function V.board_down()
+    return safe(function() return common.is_button_down(0x09) end, false)
+end
+
+function V.avatar(pl, i)
+    local c = V.av[i]
+    if not c or globals.realtime - c.t > 5 then
+        c = {t = globals.realtime, tex = safe(function() return pl:get_steam_avatar() end, nil)}
+        V.av[i] = c
+    end
+    return c.tex
+end
+
+-- команды: [1] зрители, [2] T, [3] CT
+function V.collect()
+    local res = safe(function() return entity.get_player_resource() end, nil)
+    local lp = entity.get_local_player()
+    local t = {[1] = {}, [2] = {}, [3] = {}}
+    for i = 1, 64 do
+        local pl = safe(function() return entity.get(i) end, nil)
+        if pl then
+            local name = safe(function() return pl:get_name() end, nil)
+            local team = safe(function() return pl.m_iTeamNum end, 0)
+            if name and name ~= "" and t[team] then
+                local function rv(n) return safe(function() return res[n][i] end, 0) or 0 end
+                t[team][#t[team] + 1] = {
+                    idx = i, ent = pl, name = name,
+                    money = safe(function() return pl.m_iAccount end, 0),
+                    ping = rv("m_iPing"), k = rv("m_iKills"), a = rv("m_iAssists"), d = rv("m_iDeaths"),
+                    mvp = rv("m_iMVPs"), score = rv("m_iScore"),
+                    alive = (team == 1) or safe(function() return pl:is_alive() end, true),
+                    me = (pl == lp), spec = (team == 1),
+                }
+            end
+        end
+    end
+    for _, list in pairs(t) do
+        table.sort(list, function(a, b)
+            if a.score ~= b.score then return a.score > b.score end
+            return a.k > b.k
+        end)
+    end
+    return t
+end
+
+function V.team_scores()
+    local ct, tt = 0, 0
+    for _, e in ipairs(safe(function() return entity.get_entities("CCSTeam") end, {})) do
+        local n = safe(function() return e.m_iTeamNum end, 0)
+        local s = safe(function() return e.m_scoreTotal end, 0)
+        if n == 3 then ct = s elseif n == 2 then tt = s end
+    end
+    return ct, tt
+end
+
+function V.round_time()
+    return safe(function()
+        local gr = entity.get_game_rules()
+        local left = math.max(0, gr.m_fRoundStartTime + gr.m_iRoundTime - globals.curtime)
+        return string.format("%d:%02d", math.floor(left / 60), math.floor(left % 60))
+    end, "--:--")
+end
+
+function V.server_name()
+    local cands = {
+        function() return globals.server_name end,
+        function() return utils.net_channel().remote_name end,
+        function() return cvar.hostname:string() end,
+    }
+    for _, f in ipairs(cands) do
+        local v = safe(f, nil)
+        if type(v) == "string" and v ~= "" then return v end
+    end
+    return "Server"
+end
+
+-- маленькие иконки правой плашки (график / динамик / микрофон)
+function V.top_icons(x, cy)
+    local c = color(215, 220, 235, 255)
+    pcall(render.rect_outline, vector(x, cy - 7), vector(x + 14, cy + 7), c, 1, 2)
+    V.ln(x + 3, cy + 3, x + 6, cy - 1, c); V.ln(x + 6, cy - 1, x + 9, cy + 2, c); V.ln(x + 9, cy + 2, x + 12, cy - 4, c)
+    local sx = x + 34
+    render.rect(vector(sx, cy - 3), vector(sx + 4, cy + 3), c, 1)
+    V.ln(sx + 4, cy - 3, sx + 9, cy - 7, c); V.ln(sx + 9, cy - 7, sx + 9, cy + 7, c); V.ln(sx + 9, cy + 7, sx + 4, cy + 3, c)
+    local mx = x + 66
+    pcall(render.rect_outline, vector(mx + 2, cy - 7), vector(mx + 8, cy + 2), c, 1, 3)
+    V.ln(mx, cy + 1, mx, cy + 3, c); V.ln(mx, cy + 3, mx + 10, cy + 3, c); V.ln(mx + 10, cy + 3, mx + 10, cy + 1, c)
+    V.ln(mx - 2, cy + 8, mx + 12, cy - 8, c)
+end
+
+function V.draw_board(sh)
+    local data = V.collect()
+    local W, y0 = 720, 62
+    local x = math.floor(sh.x / 2 - W / 2)
+    local COL = {money = 367, ping = 415, k = 475, a = 528, d = 582, mvp = 624, score = 681}
+
+    local secs = {
+        {"COUNTER-TERRORISTS", data[3], V.CT},
+        {"TERRORISTS", data[2], V.TT},
+    }
+    if #data[1] > 0 then secs[#secs + 1] = {"SPECTATORS", data[1], V.WHITE} end
+
+    -- высота: заголовок секции → 29 до первой строки → шаг 33 → 34 до следующего заголовка
+    local hgt = 61
+    for i, s in ipairs(secs) do
+        local n = #s[2]
+        if i < #secs then hgt = hgt + (n > 0 and (29 + 33 * (n - 1) + 34) or 34)
+        else hgt = hgt + (n > 0 and (29 + 33 * (n - 1) + 29) or 29) end
+    end
+
+    -- верхние плашки
+    local map = tostring(safe(function() return globals.mapname end, "") or "")
+    map = (map:gsub("^de_", ""):gsub("^cs_", ""):gsub("^%l", string.upper))
+    if map == "" then map = "Match" end
+    local mw = text_width(map, V.fb) + text_width("Competitive", V.fs) + 44
+    V.glass(x + 1, 12, mw, 34, 1)
+    V.tx(V.fb, x + 17, 29, V.WHITE, map)
+    V.tx(V.fs, x + 17 + text_width(map, V.fb) + 12, 30, V.DIM, "Competitive")
+
+    local ct_s, t_s = V.team_scores()
+    local cx = sh.x / 2
+    V.glass(cx - 61, 12, 122, 36, 1)
+    V.tx(V.fmid, cx - 42, 30, V.CT, ct_s, 1, "c")
+    V.tx(V.f, cx, 30, V.WHITE, V.round_time(), 1, "c")
+    V.tx(V.fmid, cx + 42, 30, V.TT, t_s, 1, "c")
+
+    V.glass(x + W - 112, 12, 112, 38, 1)
+    V.top_icons(x + W - 112 + 16, 31)
+
+    -- основная панель
+    V.glass(x, y0, W, hgt, 1, 18, 175)
+
+    local gr = safe(function() return entity.get_game_rules() end, nil)
+    local played = safe(function() return gr.m_totalRoundsPlayed end, 0) + 1
+    local maxr = safe(function() return cvar.mp_maxrounds:int() end, 30)
+    if not maxr or maxr <= 0 then maxr = 30 end
+    V.tx(V.fs, x + 13, y0 + 25, V.WHITE, "Server: " .. V.cut(V.server_name(), 70))
+    V.tx(V.fs, x + W - 14, y0 + 25, V.WHITE, "Round " .. played .. " / " .. maxr, 1, "r")
+
+    local cy = y0 + 61
+    for _, s in ipairs(secs) do
+        local title, list, accent = s[1], s[2], s[3]
+        V.tx(V.fs, x + 13, cy, accent, title)
+        for key, label in pairs({money = "Money", ping = "Ping", k = "K", a = "A", d = "D", mvp = "MVP", score = "Score"}) do
+            V.tx(V.fs, x + COL[key], cy, V.DIM, label, 1, "c")
+        end
+        for k, p in ipairs(list) do
+            local ry = cy + 29 + (k - 1) * 33
+            local a = p.alive and 1 or 0.55
+            local ac = p.alive and accent or V.DIM
+
+            if p.me then
+                render.rect(vector(x + 6, ry - 16), vector(x + W - 6, ry + 15), color(255, 255, 255, 22), 8)
+            end
+            render.rect(vector(x + 13, ry - 13), vector(x + 16, ry + 13),
+                color(ac.r, ac.g, ac.b, math.floor(255 * a)), 1)
+
+            -- аватарка (если API отдаёт текстуру), иначе заглушка
+            local ax, ay = x + 26, ry - 14
+            local drawn = false
+            local tex = V.avatar(p.ent, p.idx)
+            if tex then
+                drawn = pcall(render.texture, tex, vector(ax, ay), vector(28, 28),
+                    color(255, 255, 255, math.floor(255 * a)), "f", 4)
+            end
+            if not drawn then
+                render.rect(vector(ax, ay), vector(ax + 28, ay + 28), color(40, 42, 52, math.floor(255 * a)), 4)
+                V.tx(V.fb, ax + 14, ay + 14, V.DIM, "?", a, "c")
+            end
+
+            local nm = V.cut(p.name, 28)
+            V.tx(V.f, x + 63, ry, ac, nm, a)
+            if not p.alive and not p.spec then
+                V.pix(x + 63 + text_width(nm, V.f) + 8, ry - 7, 2, V.ICON.skull, V.DIM)
+            end
+
+            V.tx(V.fs, x + COL.money, ry, V.WHITE, "$" .. p.money, a, "c")
+            V.tx(V.fs, x + COL.ping, ry, V.WHITE, p.spec and "SPEC" or tostring(p.ping), a, "c")
+            V.tx(V.fs, x + COL.k, ry, V.WHITE, p.k, a, "c")
+            V.tx(V.fs, x + COL.a, ry, V.WHITE, p.a, a, "c")
+            V.tx(V.fs, x + COL.d, ry, V.WHITE, p.d, a, "c")
+            if p.mvp > 0 then V.tx(V.fs, x + COL.mvp, ry, V.WHITE, p.mvp, a, "c") end
+            V.tx(V.fs, x + COL.score, ry, V.WHITE, p.score, a, "c")
+        end
+        cy = cy + (#list > 0 and (29 + 33 * (#list - 1) + 34) or 34)
+    end
+
+    -- нижняя плашка: раунды и зрители
+    local by = y0 + hgt + 16
+    V.glass(x, by, W, 34, 1)
+    V.tx(V.fs, x + 30, by + 17, V.DIM, "Rounds")
+    local last = played - 1
+    local first = last > 15 and 16 or 1
+    for r = first, math.min(last, first + 14) do
+        V.tx(V.fs, x + 83 + (r - first) * 25, by + 17, V.DIM, r, 1, "c")
+    end
+    V.tx(V.fs, x + W - 20, by + 17, V.DIM, "Spectators: " .. #data[1], 1, "r")
+end
+
+-- прячем строки стандартного чата, пока включён кастомный
+function V.apply_cvar()
+    local want = M.vchat:get() and M.enable:get()
+    if want ~= V.applied then
+        V.applied = want
+        pcall(function() cvar.hud_saytext_time:float(want and 0 or 12) end)
+    end
+end
+
+function V.draw()
+    local sh = render.screen_size()
+    local lp = entity.get_local_player()
+    if M.vchat:get() then
+        if M.vchat_input:get() then V.poll_chat() end
+        V.draw_chat(sh)
+    end
+    if M.vhud:get() and lp and lp:is_alive() then V.draw_hud(lp, sh) end
+    if M.vboard:get() and V.board_down() then V.draw_board(sh) end
+end
+
+on("render", function()
+    update_aspect(); V.apply_cvar()
+
+    if not M.enable:get() then return end
+    draw_notifs()
+    V.draw()
+
+    local lp = entity.get_local_player()
+    if not lp or not lp:is_alive() then return end
+
+    if M.ind:get() then draw_indicators(lp) end
+    if M.wm:get() then draw_watermark() end
+    if M.arrows:get() then draw_arrows() end
+    if M.sideind:get() then H.draw_side() end
+    if M.logs:get() and has(M.log_out:get(), "Statistic") then draw_stats() end
+end)
+
+-- ========== СОБЫТИЯ ИГРЫ ==========
+local function reset_all()
+    for _, ref in pairs(R) do ovr(ref) end
+    for _, ref in ipairs(hc_refs) do ovr(ref) end
+    for _, ref in ipairs(H.hb) do ovr(ref) end
+    H.hb_on = false
+    if def.forced then
+        pcall(function() rage.exploit:allow_defensive(false) end)
+        def.forced = false
+    end
+end
+
+on("createmove", function(cmd)
+    RES.run(false)
+    if not M.enable:get() then
+        if was_enabled then reset_all(); was_enabled = false end
+        return
+    end
+    was_enabled = true
+    H.apply_hitboxes()
+
+    local lp = entity.get_local_player()
+    if not lp or not lp:is_alive() then return end
+
+    apply_antiaim(cmd, lp)
+    if M.ladder:get() then pcall(fast_ladder, cmd, lp) end
+end)
+
+on("pre_render", function()
+    RES.run(false)
+    if not M.enable:get() then return end
+    local lp = entity.get_local_player()
+    if not lp or not lp:is_alive() then return end
+
+    if not M.anim:get() then ovr(R.legs) return end
+    ovr(R.legs, "Sliding")
+    pcall(function()
+        local ov = lp:get_anim_overlay(12)
+        if ov and lp.m_vecVelocity:length2d() >= 3 then ov.weight = 1 end
+
+        local v, g = M.anim_value:get(), M.anim_ground:get()
+        if g == "Static" then lp.m_flPoseParameter[0] = v / 10
+        elseif g == "Jitter" then lp.m_flPoseParameter[0] = (globals.tickcount % 4 > 1) and v / 10 or 0
+        else lp.m_flPoseParameter[0] = math.random(v, 10) / 10 end
+
+        local a = M.anim_air:get()
+        if a == "Static" then lp.m_flPoseParameter[6] = 1
+        elseif a == "Kangaroo" then lp.m_flPoseParameter[6] = math.random(0, 10) / 10 end
+    end)
+end)
+
+local function is_me(e) return entity.get(e.userid, true) == entity.get_local_player() end
+
+on("grenade_thrown", function(e)
+    if not M.quick:get() or not is_me(e) then return end
+    pcall(utils.console_exec, "slot3; slot2; slot1")
+end)
+
+on("weapon_fire", function(e)
+    if not M.quick:get() or e.weapon ~= "weapon_taser" or not is_me(e) then return end
+    pcall(utils.console_exec, "slot3; slot2; slot1")
+end)
+
+-- ========== KILLSAY ==========
+-- ВАЖНО: в фразах нельзя ставить ; и " — консольная команда say их обрезает
+local PHRASES_RU = {
+    "lethe.lua тебя разъебал, а ты даже не понял откуда прилетело",
+    "ебать ты лох, тебя убил lethe.lua, а ты всё ещё думаешь что это лаги",
+    "сука, lethe.lua играет за меня, а ты и без читов умудряешься сосать",
+    "нахуй ты вообще зашёл, чмо? lethe.lua даже не включали на полную",
+    "пиздец ты слабый, lethe.lua в афк режиме тебя уработал",
+    "хуйло безрукое, удаляй игру, lethe.lua уже вынес тебя из неё",
+    "lethe.lua кладёт на твой скилл болт, и я вместе с ним",
+    "ты целишься жопой, а lethe.lua целится мозгом, вот и вся разница",
+    "блядь, тебя размазал lethe.lua, а ты ещё и чат читаешь, ебанашка",
+    "твой кд — это просто шутка, lethe.lua над ним ржёт в голос",
+    "иди нахуй с сервера, тут lethe.lua рулит, а ты тут как мишень",
+    "соси, мразота, lethe.lua тебе даже ебало не оставил",
+    "ты настолько хуёвый, что lethe.lua работает на тебя как жалкий донат",
+    "пиздабол, ты думал против lethe.lua можно играть? поиграй лучше в тетрис",
+    "ебучий нуб, lethe.lua тебя размазал по стенке и даже не вспотел",
+    "хули ты тут забыл, криворукий? lethe.lua уже посчитал твои шансы — ноль",
+    "lethe.lua: 1, ты: ноль, и в этом ноль весь твой смысл жизни в кс",
+    "ты не умер, ты просто пожертвовал кд в пользу lethe.lua, спасибо долбоёб",
+    "твой прицел живёт отдельной жизнью, а lethe.lua живёт у тебя в голове бесплатно",
+    "ебать тебя снесло, lethe.lua даже настроек не менял",
+    "сидишь с читом, а всё равно сосёшь, ну ты и хуесос, а у меня lethe.lua",
+    "блять, да даже бот на лёгком целится лучше тебя, а у меня ещё и lethe.lua",
+    "ты как реклама lethe.lua, только вместо покупателей — трупы, и ты первый",
+    "лол, нахуй ты пикнул, lethe.lua тебя заранее похоронил",
+    "ебаный стыд, тебя убил lethe.lua, а ты пойдёшь жаловаться в поддержку",
+    "твоё лицо после смерти — лучший скриншот для рекламы lethe.lua",
+    "нахуй тебе кс, иди в тетрис, там хоть lethe.lua тебя не достанет",
+    "ты не лагаешь, ты просто хуёвый, а lethe.lua просто добивает",
+    "ты думал это твой раунд? lethe.lua сказал нет, ебанашка",
+    "хуярь в спавн, lethe.lua там тебя не найдёт, наверное",
+    "я бы тебя пожалел, но lethe.lua запретил, да и сосёшь ты уж слишком охуенно",
+    "у тебя реакция как у дохлой черепахи, а у lethe.lua как у акулы, понял, дебил",
+    "если бы lethe.lua брал деньги за каждый твой труп, я бы уже купил остров",
+    "пиздец ты предсказуемый, у lethe.lua на тебя даже скрипта писать не надо",
+    "с таким скиллом тебя бы lethe.lua даже в качестве манекена не взял, брак",
+    "выкинь клаву нахуй, lethe.lua её всё равно за тебя не заменит",
+    "ты ходячий донат моему кд, а lethe.lua — твой личный палач, прими это",
+    "завали ебало и смотри, как lethe.lua учит тебя играть бесплатно",
+    "ты настолько тупой, что lethe.lua пришлось тебя убить из жалости",
+    "lethe.lua в деле, а ты нахуй в зрителях, мразота криворукая",
+    "ты бежал на меня как на праздник, а там lethe.lua, ну и пиздец у тебя настроение теперь",
+    "ты не стрелок, ты скорее мем, а lethe.lua просто делает из тебя клипы",
+    "иди тренируйся, а то lethe.lua скоро жалобу на тебя за оскорбление скилла подаст",
+    "даже твой пинг стыдится быть с тобой, а lethe.lua просто стреляет",
+    "ебало на тебе как у человека, который только что узнал, что есть lethe.lua",
+    "ты как та обезьяна с гранатой, только граната — это lethe.lua, а обезьяна ты",
+    "хуесос, ты хоть слышал что у меня lethe.lua? теперь слышал, лежи",
+    "пока ты рвал мышку, lethe.lua уже закончил твой раунд, лох",
+    "я не читер, я просто пользуюсь lethe.lua, а ты просто пользуешься чужим вниманием, и то хуёво",
+    "сука, ну и жалкое зрелище, lethe.lua аж зевнул",
+    "твоя жопа теперь официальный спонсор lethe.lua, поздравляю с повышением",
+    "блядь, смотрю на твой геймплей и понимаю, зачем придумали lethe.lua",
+    "ты молодец, умеешь красиво умирать, а lethe.lua умеет красиво убивать, учись",
+    "нахуй пошёл, lethe.lua твоим прицелом играет лучше, чем ты сам",
+    "ты не нубас, ты просто натуральная катастрофа, и lethe.lua от тебя в восторге",
+    "мразь ты тупая, lethe.lua уже записал тебя в список побеждённых, не позорься",
+    "пиздос, да тебя хоть в бота lethe.lua превращай, толку ноль",
+    "иди в ебеня, lethe.lua вырастит тебе нормальные руки, может быть",
+    "ты даже умереть нормально не можешь, lethe.lua за тебя это сделал",
+    "ебать колотить, ну и позорище, зови папу, lethe.lua уже здесь",
+    "ты наёбывал себя, что умеешь играть, а lethe.lua сказал правду",
+    "lethe.lua не ломается, в отличие от твоих надежд, чмоня",
+}
+
+local PHRASES_EN = {
+    "lethe.lua just fucked your whole family tree of skill, you donkey",
+    "holy fuck you are dogshit, lethe.lua didn't even need to try",
+    "you aim like a blind bitch, lethe.lua aims for me, you aim for the floor",
+    "fuck off to casual, lethe.lua already ate your ass for breakfast",
+    "bitch you got deleted by lethe.lua, sit your ass down",
+    "you absolute fucking bot, uninstall, lethe.lua owns your soul now",
+    "dumbfuck, your crosshair is lost, lethe.lua found it for you tho",
+    "shit aim, shit brain, shit everything, get fucked by lethe.lua",
+    "motherfucker, you peek like it's your personality, lethe.lua loves it",
+    "eat shit, lethe.lua owns your whole fucking existence",
+    "you're so fucking bad lethe.lua almost felt sorry, almost",
+    "suck it, kid, lethe.lua humiliated you in front of everyone",
+    "lmao what a worthless piece of trash, lethe.lua sends regards",
+    "fuck your ping, you just suck, bitch, lethe.lua never misses",
+    "shut the fuck up and learn to play, lethe.lua is teaching for free",
+    "you died like a little bitch, lethe.lua barely noticed you",
+    "get the fuck out of this server, lethe.lua is the only one allowed here",
+    "what the fuck was that peek, are you braindead? lethe.lua loved it",
+    "ez, you absolute waste of a spawn, thanks lethe.lua",
+    "you're a walking free kill, you dumb bastard, lethe.lua says thanks",
+    "go fuck yourself with your trash config, lethe.lua is the real deal",
+    "even bots are better than you, loser, and lethe.lua made them better",
+    "you play like shit and talk like shit, lethe.lua stays winning",
+    "hey asshole, nice shot, did you do it with your eyes closed? lethe.lua did",
+    "lethe.lua fucked you up so hard your grandpa felt it",
+    "dickhead, learn to aim before you open your mouth, lethe.lua already did",
+    "stay in spawn you useless fuck, lethe.lua doesn't hunt in kindergartens",
+    "1 you fucking donkey, 1 brought to you by lethe.lua",
+    "skill issue, permanent, fucking terminal, lethe.lua is the cure for nothing",
+    "damn bitch, you really thought you could beat lethe.lua?",
+    "you're the reason lethe.lua has a highlight reel, thanks clown",
+    "lethe.lua is carrying and you're still losing, imagine being you",
+    "bro your gameplay is so trash lethe.lua refuses to leave the kill feed",
+    "fuck me, you're slow, lethe.lua got bored waiting for you to hit",
+    "lethe.lua and my dick are both bigger than your headshot rate, bitch",
+    "get a life, get a real aim, get lethe.lua, in that order, you fucking loser",
+    "dogwater player vs lethe.lua, guess who's the water",
+    "you just got outplayed by a lua script and a bad mood, bitch",
+    "lethe.lua says hi, and also fuck you",
+    "fucking rat, hiding in corners won't save you from lethe.lua",
+}
+
+local function pick_phrase(mode)
+    local list
+    if mode == "RU" then list = PHRASES_RU
+    elseif mode == "EN" then list = PHRASES_EN
+    else
+        list = {}
+        for _, p in ipairs(PHRASES_RU) do list[#list + 1] = p end
+        for _, p in ipairs(PHRASES_EN) do list[#list + 1] = p end
+    end
+    return list[math.random(1, #list)]
+end
+
+on("player_death", function(e)
+    local lp = entity.get_local_player()
+    local victim, attacker = entity.get(e.userid, true), entity.get(e.attacker, true)
+
+    if not M.enable:get() then return end
+    if attacker ~= lp or not victim or not victim:is_enemy() then return end
+
+    local mode, text = M.killsay:get(), nil
+    if mode == "1" then text = "1"
+    elseif mode ~= "None" then text = pick_phrase(mode) end
+    if text then
+        local delay = mode == "1" and 0.5 or (1.2 + math.random() * 1.4)
+        pcall(utils.execute_after, delay, function()
+            utils.console_exec('say "' .. text .. '"')
+        end)
+    end
+end)
+
+on("round_start", function()
+    round_ended = false
+    eng.side, eng.last, eng.wait, eng.streak, eng.sidebag, eng.fz_cd = false, 0, 1, 1, {}, 0
+    eng.bags, eng.lastd = {}, {}
+    if M.res_reset:get() then RES.data = {} end
+    eng.phase, eng.phase_until, eng.bf_imp, eng.bf_hurt, eng.bf_flip = 1, 0, false, false, false
+    dfs.step = 0
+    def.max, def.windows = 0, 0
+    -- Anti-Bruteforce
+    H.bf.idx, H.bf.miss, H.bf.imp, H.bf.hurt = 0, 0, false, false
+    H.am.untl, H.am.hurts = 0, {}
+    H.md.yaw, H.md.lim_l, H.md.lim_cfg = nil, nil, nil
+    H.logs = {}
+end)
+
+on("round_end", function() round_ended = true end)
+
+on("round_prestart", function()
+    notifs = {}
+    if M.logs:get() and has(M.log_out:get(), "On Screen") then
+        notify("info", {title = "LETHE", name = "anti-aim data reset"})
+    end
+end)
+
+on("shutdown", function()
+    reset_all()
+    pcall(function() cvar.r_aspectratio:float(0) end)
+    pcall(function() cvar.hud_saytext_time:float(12) end)
+end)
+
+pcall(utils.execute_after, 1.6, function()
+    notify("info", {title = "LETHE", name = "loaded", detail = "v1.6  ·  " .. username})
+end)
+
+local missing = {}
+for k, v in pairs(R) do if not v then missing[#missing + 1] = k end end
+print("[lethe] loaded, hitchance refs: " .. #hc_refs .. ", hitbox refs: " .. #H.hb ..
+    ", missing refs: " .. (#missing > 0 and table.concat(missing, ", ") or "none"))
